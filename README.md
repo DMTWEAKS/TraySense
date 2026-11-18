@@ -1,5 +1,7 @@
 # TraySense
 
+[![Downloads](https://img.shields.io/github/downloads/DMTWEAKS/traysense/total?label=downloads)](https://github.com/DMTWEAKS/traysense/releases) [![Latest release](https://img.shields.io/github/v/release/DMTWEAKS/traysense)](https://github.com/DMTWEAKS/traysense/releases/latest)
+
 Small system monitor that sits on the Windows taskbar next to the tray. Shows CPU, RAM, GPU, VRAM and temps.
 
 ```
