@@ -6,7 +6,7 @@ Small system monitor that sits on the Windows taskbar next to the tray. Shows CP
 [cpu] 12% 54°   [ram] 61%   [gpu] 4% 44° VRAM 6%   [ssd] 38°
 ```
 
-It's one C file using plain Win32, so the exe is around 100 KB and it uses a couple MB of RAM. It only redraws when a number changes and it stops polling when the screen is off.
+It's one C file using plain Win32, so the exe is around 100 KB and it uses a 1-3 MB of RAM at max. It only redraws when a number changes and it stops polling when the screen is off.
 
 Works on Windows 10 and 11.
 
