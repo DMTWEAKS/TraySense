@@ -110,6 +110,38 @@ static int sys_path(wchar_t *out, const wchar_t *file)
     return 1;
 }
 
+static HANDLE g_self = INVALID_HANDLE_VALUE;
+
+static void lock_self(void)
+{
+    wchar_t p[MAX_PATH];
+    DWORD n = GetModuleFileNameW(NULL, p, MAX_PATH);
+    if (n && n < MAX_PATH)
+        g_self = CreateFileW(p, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+}
+
+static int copy_self(const wchar_t *dst)
+{
+    LARGE_INTEGER sz, zero = { 0 };
+    DWORD got, w;
+    int ok = 0;
+    if (g_self == INVALID_HANDLE_VALUE || !GetFileSizeEx(g_self, &sz) || sz.QuadPart <= 0 || sz.QuadPart > (16 << 20))
+        return 0;
+    BYTE *buf = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)sz.QuadPart);
+    if (!buf) return 0;
+    if (SetFilePointerEx(g_self, zero, NULL, FILE_BEGIN) &&
+        ReadFile(g_self, buf, (DWORD)sz.QuadPart, &got, NULL) && got == (DWORD)sz.QuadPart) {
+        HANDLE f = CreateFileW(dst, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
+        if (f != INVALID_HANDLE_VALUE) {
+            ok = WriteFile(f, buf, got, &w, NULL) && w == got;
+            CloseHandle(f);
+            if (!ok) DeleteFileW(dst);
+        }
+    }
+    HeapFree(GetProcessHeap(), 0, buf);
+    return ok;
+}
+
 static int app_dir(wchar_t *out)
 {
     DWORD sz = MAX_PATH * sizeof(wchar_t);
@@ -1331,7 +1363,7 @@ static void task_create(const wchar_t *exe)
     DWORD one = 1, w;
     if (!app_dir(dir) || !user_sid(sid, 184)) return;
     _snwprintf(dst, MAX_PATH, L"%s\\TraySense.exe", dir); dst[MAX_PATH - 1] = 0;
-    if (lstrcmpiW(exe, dst) && !CopyFileW(exe, dst, FALSE)) return;
+    if (lstrcmpiW(exe, dst) && !copy_self(dst)) return;
     xml_escape(esc, MAX_PATH * 5, dst);
     _snwprintf(xmlPath, MAX_PATH, L"%s\\task.xml", dir); xmlPath[MAX_PATH - 1] = 0;
     _snwprintf(xml, 3072,
@@ -1531,6 +1563,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
         if (f) f(LOAD_LIBRARY_SEARCH_SYSTEM32);
         SetDllDirectoryW(L"");
     }
+    if (is_admin()) lock_self();
     int restart = wcsstr(GetCommandLineW(), L"/restart") != NULL;
     for (int tries = 0;; tries++) {
         HANDLE mx = CreateMutexW(NULL, TRUE, L"Local\\TraySense.single");
