@@ -19,6 +19,7 @@
 #include <winhttp.h>
 #include <bcrypt.h>
 #include <sddl.h>
+#include <uiautomationclient.h>
 
 static HMODULE sysdll(const wchar_t *name)
 {
@@ -870,7 +871,7 @@ static int     g_child, g_barW, g_barH, g_dpi = 96;
 static RECT    g_lastPos;
 static wchar_t g_barSig[160];
 
-typedef struct { int glyph, sh, x, w, al; wchar_t t[8]; COLORREF c; } SEG;
+typedef struct { int glyph, sh, x, y, w, al, f, row; wchar_t t[8]; COLORREF c; } SEG;
 enum { G_CPU, G_RAM, G_GPU, G_DISK };
 
 static int SC(int v) { return MulDiv(v, g_dpi, 96); }
@@ -950,6 +951,97 @@ static void bar_destroy(void)
     g_bar = 0;
 }
 
+static volatile LONG g_scanOK, g_trayL, g_appsR;
+static int g_compact, g_wideW;
+static IUIAutomation *g_uia;
+static IUIAutomationCacheRequest *g_uiaCache;
+static IUIAutomationCondition *g_uiaAll;
+
+static const GUID CLSID_UIA = {0xff48dba4,0x60ef,0x4201,{0xaa,0x87,0x54,0x10,0x3e,0xef,0x59,0x4e}};
+static const GUID IID_UIA   = {0x30cbe57d,0xd9d0,0x452a,{0xab,0x13,0x7a,0xc5,0xac,0x48,0x25,0xee}};
+static const GUID IID_CF    = {0x00000001,0x0000,0x0000,{0xc0,0x00,0x00,0x00,0x00,0x00,0x00,0x46}};
+
+static int uia_init(void)
+{
+    static int tried;
+    if (tried) return g_uia != NULL;
+    tried = 1;
+    HMODULE m = sysdll(L"UIAutomationCore.dll");
+    typedef HRESULT (WINAPI *DGCO)(const GUID *, const GUID *, void **);
+    DGCO get = m ? (DGCO)(void *)GetProcAddress(m, "DllGetClassObject") : NULL;
+    IClassFactory *cf = NULL;
+    if (!get || FAILED(get(&CLSID_UIA, &IID_CF, (void **)&cf)) || !cf) return 0;
+    HRESULT hr = IClassFactory_CreateInstance(cf, NULL, &IID_UIA, (void **)&g_uia);
+    IClassFactory_Release(cf);
+    if (FAILED(hr) || !g_uia) { g_uia = NULL; return 0; }
+    if (FAILED(IUIAutomation_CreateCacheRequest(g_uia, &g_uiaCache)) ||
+        FAILED(IUIAutomation_CreateTrueCondition(g_uia, &g_uiaAll))) {
+        IUIAutomation_Release(g_uia); g_uia = NULL; return 0;
+    }
+    IUIAutomationCacheRequest_AddProperty(g_uiaCache, UIA_ClassNamePropertyId);
+    IUIAutomationCacheRequest_AddProperty(g_uiaCache, UIA_BoundingRectanglePropertyId);
+    IUIAutomationCacheRequest_AddProperty(g_uiaCache, UIA_IsOffscreenPropertyId);
+    IUIAutomationCacheRequest_put_AutomationElementMode(g_uiaCache, AutomationElementMode_None);
+    return 1;
+}
+
+static int starts(const wchar_t *s, const wchar_t *p)
+{
+    return s && !wcsncmp(s, p, wcslen(p));
+}
+
+static void uia_scan(void)
+{
+    static RECT rc[256];
+    static BYTE app[256];
+    HWND tb = FindWindowW(L"Shell_TrayWnd", NULL);
+    RECT tr;
+    if (!tb || !GetWindowRect(tb, &tr) ||
+        !FindWindowExW(tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL) || !uia_init()) {
+        g_scanOK = 0;
+        return;
+    }
+    IUIAutomationElement *root = NULL;
+    IUIAutomationElementArray *arr = NULL;
+    int n = 0, cnt = 0;
+    if (SUCCEEDED(IUIAutomation_ElementFromHandle(g_uia, (UIA_HWND)tb, &root)) && root &&
+        SUCCEEDED(IUIAutomationElement_FindAllBuildCache(root, TreeScope_Descendants, g_uiaAll, g_uiaCache, &arr)) && arr)
+        IUIAutomationElementArray_get_Length(arr, &cnt);
+    int tbw = tr.right - tr.left;
+    for (int i = 0; i < cnt && n < 256; i++) {
+        IUIAutomationElement *e = NULL;
+        if (FAILED(IUIAutomationElementArray_GetElement(arr, i, &e)) || !e) continue;
+        BSTR cls = NULL; RECT r; BOOL off = FALSE;
+        IUIAutomationElement_get_CachedClassName(e, &cls);
+        IUIAutomationElement_get_CachedBoundingRectangle(e, &r);
+        IUIAutomationElement_get_CachedIsOffscreen(e, &off);
+        int w = r.right - r.left;
+        if (!off && w > 0 && r.bottom > r.top && w < tbw / 3 && r.top < tr.bottom && r.bottom > tr.top &&
+            !(cls && !lstrcmpW(cls, L"TraySenseBar"))) {
+            rc[n] = r;
+            app[n] = starts(cls, L"Taskbar.") || starts(cls, L"StartButton") || starts(cls, L"SearchBox");
+            n++;
+        }
+        if (cls) SysFreeString(cls);
+        IUIAutomationElement_Release(e);
+    }
+    if (arr) IUIAutomationElementArray_Release(arr);
+    if (root) IUIAutomationElement_Release(root);
+
+    int appsR = tr.left, trayL = tr.right, apps = 0;
+    for (int i = 0; i < n; i++)
+        if (app[i] && rc[i].right > appsR) { appsR = rc[i].right; apps = 1; }
+    for (int i = 0; i < n; i++)
+        if (!app[i] && rc[i].left >= appsR && rc[i].left < trayL) trayL = rc[i].left;
+    HWND tn = FindWindowExW(tb, NULL, L"TrayNotifyWnd", NULL);
+    RECT nr;
+    if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left && nr.left < trayL) trayL = nr.left;
+    if (!apps || trayL <= appsR) { g_scanOK = 0; return; }
+    InterlockedExchange(&g_appsR, appsR);
+    InterlockedExchange(&g_trayL, trayL);
+    InterlockedExchange(&g_scanOK, 1);
+}
+
 static void bar_place(void)
 {
     RECT tr, nr;
@@ -957,8 +1049,16 @@ static void bar_place(void)
     if (!g_tb || !GetWindowRect(g_tb, &tr)) { ShowWindow(g_bar, SW_HIDE); return; }
     HWND tn = FindWindowExW(g_tb, NULL, L"TrayNotifyWnd", NULL);
     if (!tn || !GetWindowRect(tn, &nr) || nr.right <= nr.left) { nr = tr; nr.left = tr.right - SC(280); }
-    int h = tr.bottom - tr.top;
-    int x = nr.left - g_barW - SC(4) + SC(g_offset), y = tr.top;
+    int h = tr.bottom - tr.top, scan = g_scanOK;
+    int right = (scan ? (int)g_trayL : nr.left) - SC(10) + SC(g_offset);
+    int avail = right - (scan ? (int)g_appsR + SC(6) : tr.left);
+    int compact = g_compact ? g_wideW > avail - SC(10) : g_wideW > avail;
+    if (compact != g_compact) {
+        g_compact = compact;
+        g_barSig[0] = 0;
+        PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
+    }
+    int x = right - g_barW, y = tr.top;
     if (g_child) { POINT p = { x, y }; ScreenToClient(g_tb, &p); x = p.x; y = p.y; }
     RECT want = { x, y, x + g_barW, y + h };
     int top = g_child ? GetWindow(g_tb, GW_CHILD) == g_bar : 1;
@@ -1016,7 +1116,7 @@ static void draw_gpu(HDC dc, int x0, int y0, int sz)
 #undef GY
 }
 
-static HFONT g_barFont, g_icoFont;
+static HFONT g_barFont, g_smallFont, g_icoFont;
 static int   g_barFontDpi, g_icoOK[4];
 static const wchar_t ICO_CH[4] = { 0xEEA1, 0xEEA0, 0, 0xEDA2 };
 static const MAT2 MAT_ID = { {0,1}, {0,0}, {0,0}, {0,1} };
@@ -1036,11 +1136,15 @@ static void bar_fonts(HDC dc)
 {
     if (g_barFont && g_barFontDpi == g_dpi) return;
     if (g_barFont) DeleteObject(g_barFont);
+    if (g_smallFont) DeleteObject(g_smallFont);
     if (g_icoFont) DeleteObject(g_icoFont);
-    int tp = SC(14) * SS, ip = SC(16) * SS;
+    int tp = SC(14) * SS, sp = SC(12) * SS, ip = SC(16) * SS;
     g_barFont = mkfont(dc, L"Segoe UI Variable Text", tp, FW_NORMAL);
     if (!g_barFont) g_barFont = mkfont(dc, L"Segoe UI", tp, FW_NORMAL);
     if (!g_barFont) g_barFont = CreateFontW(-tp, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Tahoma");
+    g_smallFont = mkfont(dc, L"Segoe UI Variable Text", sp, FW_NORMAL);
+    if (!g_smallFont) g_smallFont = mkfont(dc, L"Segoe UI", sp, FW_NORMAL);
+    if (!g_smallFont) g_smallFont = CreateFontW(-sp, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Tahoma");
     g_icoFont = mkfont(dc, L"Segoe Fluent Icons", ip, FW_NORMAL);
     if (!g_icoFont) g_icoFont = mkfont(dc, L"Segoe MDL2 Assets", ip, FW_NORMAL);
     for (int k = 0; k < 4; k++) {
@@ -1065,10 +1169,59 @@ static void ink(HDC dc, wchar_t ch, int *top, int *h, int *left, int *w)
     *left = gm.gmptGlyphOrigin.x; *w = gm.gmBlackBoxX;
 }
 
+static int text_w(HDC dc, const wchar_t *t)
+{
+    SIZE s;
+    GetTextExtentPoint32W(dc, t, lstrlenW(t), &s);
+    return s.cx;
+}
+
+static int layout(HDC dc, SEG *sg, int n, int compact, int HB)
+{
+    int gs = SC(16) * SS, top, h, d1, d2, X = SC(4) * SS;
+    if (!compact) {
+        SelectObject(dc, g_barFont);
+        ink(dc, L'0', &top, &h, &d1, &d2);
+        for (int i = 0; i < n; i++) {
+            if (sg[i].glyph) { if (i) X += SC(14) * SS; sg[i].w = gs; }
+            else {
+                X += (sg[i - 1].glyph ? SC(6) : sg[i].al < 255 ? SC(9) : sg[i - 1].al < 255 ? SC(4) : SC(5)) * SS;
+                sg[i].w = text_w(dc, sg[i].t);
+                sg[i].y = HB / 2 - (top + h / 2);
+                sg[i].f = 0; sg[i].row = -1;
+            }
+            sg[i].x = X; X += sg[i].w;
+        }
+        return X + SC(4) * SS;
+    }
+    SelectObject(dc, g_smallFont);
+    ink(dc, L'0', &top, &h, &d1, &d2);
+    int gap = SC(3) * SS, yTop = HB / 2 - gap / 2 - h - top, yBot = HB / 2 + gap / 2 - top, yMid = HB / 2 - h / 2 - top;
+    for (int i = 0; i < n;) {
+        if (sg[i].glyph) {
+            if (i) X += SC(10) * SS;
+            sg[i].x = X; sg[i].w = gs; X += gs;
+            i++;
+            continue;
+        }
+        int a = i, b = (i + 1 < n && !sg[i + 1].glyph && sg[i + 1].al == 255) ? i + 1 : -1;
+        X += (sg[a - 1].glyph ? SC(5) : SC(7)) * SS;
+        int wa = text_w(dc, sg[a].t), wb = b >= 0 ? text_w(dc, sg[b].t) : 0;
+        sg[a].x = X; sg[a].w = wa; sg[a].f = 1;
+        if (b >= 0) {
+            sg[a].y = yTop; sg[a].row = 0;
+            sg[b].x = X; sg[b].w = wb; sg[b].f = 1; sg[b].y = yBot; sg[b].row = 1;
+        } else { sg[a].y = yMid; sg[a].row = -1; }
+        X += wa > wb ? wa : wb;
+        i = b >= 0 ? b + 1 : a + 1;
+    }
+    return X + SC(4) * SS;
+}
+
 static void bar_draw(int force)
 {
-    static COLORREF colOf[1024];
-    static BYTE alOf[1024];
+    static COLORREF colOf[2][1024];
+    static BYTE alOf[2][1024];
     static BYTE gc[64 * 64], lut[256];
     if (!lut[255]) for (int i = 0; i < 256; i++) lut[i] = (BYTE)(255.0 * pow(i / 255.0, 0.8) + 0.5);
     if (!g_bar) return;
@@ -1104,7 +1257,7 @@ static void bar_draw(int force)
         seg_temp(&sg[n++], M_DISKT, fg);
     }
 
-    wchar_t sig[160]; int p = _snwprintf(sig, 160, L"%d|%d|%d|%d|", H, g_dpi, g_light, n);
+    wchar_t sig[160]; int p = _snwprintf(sig, 160, L"%d|%d|%d|%d|%d|", H, g_dpi, g_light, n, g_compact);
     for (int i = 0; i < n && p > 0 && p < 140; i++)
         if (!sg[i].glyph) p += _snwprintf(sig + p, 160 - p, L"%s%06X|", sg[i].t, (unsigned)sg[i].c);
     sig[159] = 0;
@@ -1113,22 +1266,11 @@ static void bar_draw(int force)
 
     HDC mdc = CreateCompatibleDC(NULL);
     bar_fonts(mdc);
-    int HB = H * SS, gs = SC(16);
+    int HB = H * SS;
 
-    int tTop, tH, dum1, dum2;
     HGDIOBJ of = SelectObject(mdc, g_barFont);
-    ink(mdc, L'0', &tTop, &tH, &dum1, &dum2);
-    int X = SC(4) * SS;
-    for (int i = 0; i < n; i++) {
-        if (sg[i].glyph) { if (i) X += SC(14) * SS; sg[i].w = gs * SS; }
-        else {
-            SIZE s; GetTextExtentPoint32W(mdc, sg[i].t, lstrlenW(sg[i].t), &s);
-            X += (sg[i - 1].glyph ? SC(6) : sg[i].al < 255 ? SC(9) : sg[i - 1].al < 255 ? SC(4) : SC(5)) * SS;
-            sg[i].w = s.cx;
-        }
-        sg[i].x = X; X += sg[i].w;
-    }
-    int W = (X + SC(4) * SS + SS - 1) / SS;
+    g_wideW = (layout(mdc, sg, n, 0, HB) + SS - 1) / SS;
+    int W = g_compact ? (layout(mdc, sg, n, 1, HB) + SS - 1) / SS : g_wideW;
     if (W > 1024) W = 1024;
     int WB = W * SS;
 
@@ -1149,14 +1291,18 @@ static void bar_draw(int force)
     ZeroMemory(bp, (SIZE_T)WB * HB * 4);
     SetBkMode(mdc, TRANSPARENT);
     SetTextColor(mdc, RGB(255, 255, 255));
-    for (int i = 0; i < W; i++) { colOf[i] = fg; alOf[i] = 255; }
+    for (int r = 0; r < 2; r++)
+        for (int i = 0; i < W; i++) { colOf[r][i] = fg; alOf[r][i] = 255; }
 
-    int ty = HB / 2 - (tTop + tH / 2);
     for (int i = 0; i < n; i++) {
         if (sg[i].glyph) continue;
-        TextOutW(mdc, sg[i].x, ty, sg[i].t, lstrlenW(sg[i].t));
-        for (int k = sg[i].x / SS - 1; k <= (sg[i].x + sg[i].w) / SS + 1 && k < W; k++)
-            if (k >= 0) { colOf[k] = sg[i].c; alOf[k] = (BYTE)sg[i].al; }
+        SelectObject(mdc, sg[i].f ? g_smallFont : g_barFont);
+        TextOutW(mdc, sg[i].x, sg[i].y, sg[i].t, lstrlenW(sg[i].t));
+        for (int r = 0; r < 2; r++) {
+            if (sg[i].row >= 0 && sg[i].row != r) continue;
+            for (int k = sg[i].x / SS - 1; k <= (sg[i].x + sg[i].w) / SS + 1 && k < W; k++)
+                if (k >= 0) { colOf[r][k] = sg[i].c; alOf[r][k] = (BYTE)sg[i].al; }
+        }
     }
     for (int i = 0; i < n; i++)
         if (sg[i].glyph && sg[i].sh == G_GPU) draw_gpu(mdc, sg[i].x, HB / 2 - sg[i].w / 2, sg[i].w);
@@ -1176,15 +1322,16 @@ static void bar_draw(int force)
                 const DWORD *row = bp + (y * SS + j) * WB + x * SS;
                 for (int i = 0; i < SS; i++) sum += row[i] & 0xFF;
             }
-            DWORD a = lut[sum / (SS * SS)] * alOf[x] / 255;
-            COLORREF c = colOf[x];
+            int r = y >= H / 2;
+            DWORD a = lut[sum / (SS * SS)] * alOf[r][x] / 255;
+            COLORREF c = colOf[r][x];
             px[y * W + x] = a ? (a << 24) | ((GetRValue(c) * a / 255) << 16) | ((GetGValue(c) * a / 255) << 8) | (GetBValue(c) * a / 255)
                               : 0x01000000;
         }
     SelectObject(mdc, bmp);
     DeleteObject(big);
 
-    int gy = (H - gs) / 2;
+    int gs = SC(16), gy = (H - gs) / 2;
     for (int i = 0; i < n; i++) {
         if (!sg[i].glyph || sg[i].sh == G_GPU || g_icoOK[sg[i].sh]) continue;
         glyph_cov(sg[i].sh == G_CPU ? SH_CPU : SH_RAM, gs > 64 ? 64 : gs, gc);
@@ -1224,14 +1371,24 @@ static DWORD WINAPI sampler(void *unused)
 {
     (void)unused;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+    int com = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED));
+    unsigned tick = 0;
     read_cpu();
     for (;;) {
         if (g_quit) break;
         if (InterlockedExchange(&g_rebuild, 0)) build_query();
-        if (!g_paused) { sample(); PostMessageW(g_wnd, WM_SAMPLED, 0, 0); }
+        if (!g_paused) {
+            sample();
+            if (com && g_mode == MODE_BAR && tick++ % (g_interval < 2000 ? 2 : 1) == 0) uia_scan();
+            PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
+        }
         WaitForSingleObject(g_wake, g_paused ? INFINITE : g_interval);
     }
     if (g_q) PdhCloseQuery(g_q);
+    if (g_uiaAll) IUIAutomationCondition_Release(g_uiaAll);
+    if (g_uiaCache) IUIAutomationCacheRequest_Release(g_uiaCache);
+    if (g_uia) IUIAutomation_Release(g_uia);
+    if (com) CoUninitialize();
     return 0;
 }
 
