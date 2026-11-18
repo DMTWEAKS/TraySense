@@ -18,6 +18,109 @@
 #endif
 #include <winhttp.h>
 #include <bcrypt.h>
+#include <sddl.h>
+
+static HMODULE sysdll(const wchar_t *name)
+{
+    return LoadLibraryExW(name, NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
+typedef PDH_STATUS (WINAPI *T_PdhOpenQueryW)(LPCWSTR, DWORD_PTR, PDH_HQUERY *);
+typedef PDH_STATUS (WINAPI *T_PdhAddEnglishCounterW)(PDH_HQUERY, LPCWSTR, DWORD_PTR, PDH_HCOUNTER *);
+typedef PDH_STATUS (WINAPI *T_PdhCollectQueryData)(PDH_HQUERY);
+typedef PDH_STATUS (WINAPI *T_PdhGetFormattedCounterArrayW)(PDH_HCOUNTER, DWORD, LPDWORD, LPDWORD, PPDH_FMT_COUNTERVALUE_ITEM_W);
+typedef PDH_STATUS (WINAPI *T_PdhCloseQuery)(PDH_HQUERY);
+typedef HINTERNET (WINAPI *T_WinHttpOpen)(LPCWSTR, DWORD, LPCWSTR, LPCWSTR, DWORD);
+typedef HINTERNET (WINAPI *T_WinHttpConnect)(HINTERNET, LPCWSTR, INTERNET_PORT, DWORD);
+typedef HINTERNET (WINAPI *T_WinHttpOpenRequest)(HINTERNET, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR, LPCWSTR *, DWORD);
+typedef BOOL (WINAPI *T_WinHttpSendRequest)(HINTERNET, LPCWSTR, DWORD, LPVOID, DWORD, DWORD, DWORD_PTR);
+typedef BOOL (WINAPI *T_WinHttpReceiveResponse)(HINTERNET, LPVOID);
+typedef BOOL (WINAPI *T_WinHttpQueryHeaders)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
+typedef BOOL (WINAPI *T_WinHttpQueryDataAvailable)(HINTERNET, LPDWORD);
+typedef BOOL (WINAPI *T_WinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL (WINAPI *T_WinHttpCloseHandle)(HINTERNET);
+typedef NTSTATUS (WINAPI *T_BCryptOpenAlgorithmProvider)(BCRYPT_ALG_HANDLE *, LPCWSTR, LPCWSTR, ULONG);
+typedef NTSTATUS (WINAPI *T_BCryptCreateHash)(BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE *, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
+typedef NTSTATUS (WINAPI *T_BCryptHashData)(BCRYPT_HASH_HANDLE, PUCHAR, ULONG, ULONG);
+typedef NTSTATUS (WINAPI *T_BCryptFinishHash)(BCRYPT_HASH_HANDLE, PUCHAR, ULONG, ULONG);
+typedef NTSTATUS (WINAPI *T_BCryptDestroyHash)(BCRYPT_HASH_HANDLE);
+typedef NTSTATUS (WINAPI *T_BCryptCloseAlgorithmProvider)(BCRYPT_ALG_HANDLE, ULONG);
+
+#define FN(n) static T_##n p_##n;
+FN(PdhOpenQueryW) FN(PdhAddEnglishCounterW) FN(PdhCollectQueryData) FN(PdhGetFormattedCounterArrayW) FN(PdhCloseQuery)
+FN(WinHttpOpen) FN(WinHttpConnect) FN(WinHttpOpenRequest) FN(WinHttpSendRequest) FN(WinHttpReceiveResponse)
+FN(WinHttpQueryHeaders) FN(WinHttpQueryDataAvailable) FN(WinHttpReadData) FN(WinHttpCloseHandle)
+FN(BCryptOpenAlgorithmProvider) FN(BCryptCreateHash) FN(BCryptHashData) FN(BCryptFinishHash)
+FN(BCryptDestroyHash) FN(BCryptCloseAlgorithmProvider)
+#undef FN
+#define GETFN(m, n) ((p_##n = (T_##n)(void *)GetProcAddress(m, #n)) != NULL)
+
+static int load_pdh(void)
+{
+    static int done, ok;
+    if (done) return ok;
+    done = 1;
+    HMODULE m = sysdll(L"pdh.dll");
+    ok = m && GETFN(m, PdhOpenQueryW) && GETFN(m, PdhAddEnglishCounterW) && GETFN(m, PdhCollectQueryData) &&
+         GETFN(m, PdhGetFormattedCounterArrayW) && GETFN(m, PdhCloseQuery);
+    return ok;
+}
+
+static int load_net(void)
+{
+    static int done, ok;
+    if (done) return ok;
+    done = 1;
+    HMODULE w = sysdll(L"winhttp.dll"), b = sysdll(L"bcrypt.dll");
+    ok = w && b && GETFN(w, WinHttpOpen) && GETFN(w, WinHttpConnect) && GETFN(w, WinHttpOpenRequest) &&
+         GETFN(w, WinHttpSendRequest) && GETFN(w, WinHttpReceiveResponse) && GETFN(w, WinHttpQueryHeaders) &&
+         GETFN(w, WinHttpQueryDataAvailable) && GETFN(w, WinHttpReadData) && GETFN(w, WinHttpCloseHandle) &&
+         GETFN(b, BCryptOpenAlgorithmProvider) && GETFN(b, BCryptCreateHash) && GETFN(b, BCryptHashData) &&
+         GETFN(b, BCryptFinishHash) && GETFN(b, BCryptDestroyHash) && GETFN(b, BCryptCloseAlgorithmProvider);
+    return ok;
+}
+
+#define PdhOpenQueryW                p_PdhOpenQueryW
+#define PdhAddEnglishCounterW        p_PdhAddEnglishCounterW
+#define PdhCollectQueryData          p_PdhCollectQueryData
+#define PdhGetFormattedCounterArrayW p_PdhGetFormattedCounterArrayW
+#define PdhCloseQuery                p_PdhCloseQuery
+#define WinHttpOpen                  p_WinHttpOpen
+#define WinHttpConnect               p_WinHttpConnect
+#define WinHttpOpenRequest           p_WinHttpOpenRequest
+#define WinHttpSendRequest           p_WinHttpSendRequest
+#define WinHttpReceiveResponse       p_WinHttpReceiveResponse
+#define WinHttpQueryHeaders          p_WinHttpQueryHeaders
+#define WinHttpQueryDataAvailable    p_WinHttpQueryDataAvailable
+#define WinHttpReadData              p_WinHttpReadData
+#define WinHttpCloseHandle           p_WinHttpCloseHandle
+#define BCryptOpenAlgorithmProvider  p_BCryptOpenAlgorithmProvider
+#define BCryptCreateHash             p_BCryptCreateHash
+#define BCryptHashData               p_BCryptHashData
+#define BCryptFinishHash             p_BCryptFinishHash
+#define BCryptDestroyHash            p_BCryptDestroyHash
+#define BCryptCloseAlgorithmProvider p_BCryptCloseAlgorithmProvider
+
+static int sys_path(wchar_t *out, const wchar_t *file)
+{
+    UINT n = GetSystemDirectoryW(out, MAX_PATH);
+    if (!n || n + lstrlenW(file) + 2 >= MAX_PATH) return 0;
+    lstrcatW(out, L"\\");
+    lstrcatW(out, file);
+    return 1;
+}
+
+static int app_dir(wchar_t *out)
+{
+    DWORD sz = MAX_PATH * sizeof(wchar_t);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion", L"ProgramFilesDir",
+                     RRF_RT_REG_SZ, NULL, out, &sz) != ERROR_SUCCESS) return 0;
+    if (lstrlenW(out) > MAX_PATH - 48) return 0;
+    lstrcatW(out, L"\\TraySense");
+    if (!CreateDirectoryW(out, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) return 0;
+    DWORD a = GetFileAttributesW(out);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_DIRECTORY) && !(a & FILE_ATTRIBUTE_REPARSE_POINT);
+}
 
 #define APP      L"TraySense"
 #define REGKEY   L"Software\\TraySense"
@@ -184,7 +287,7 @@ static void read_gpu_temp(void)
 
 static void init_gpu(void)
 {
-    HMODULE d = LoadLibraryW(L"dxgi.dll");
+    HMODULE d = sysdll(L"dxgi.dll");
     if (d) {
         typedef HRESULT (WINAPI *CF)(const GUID *, void **);
         CF cf = (CF)(void *)GetProcAddress(d, "CreateDXGIFactory1");
@@ -216,8 +319,9 @@ static void init_gpu(void)
 
     double t;
     if (!kmt_temp(&t)) {
-        HMODULE nv = LoadLibraryW(L"nvml.dll");
-        if (!nv) nv = LoadLibraryW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll");
+        HMODULE nv = sysdll(L"nvml.dll");
+        if (!nv) nv = LoadLibraryExW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll", NULL,
+                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (nv) {
             int (*init)(void) = (int (*)(void))(void *)GetProcAddress(nv, "nvmlInit_v2");
             int (*hnd)(unsigned, void **) = (int (*)(unsigned, void **))(void *)GetProcAddress(nv, "nvmlDeviceGetHandleByIndex_v2");
@@ -261,12 +365,6 @@ static void pio_init(void)
     g_cpuVendor = b == 0x756e6547 ? 1 : b == 0x68747541 ? 2 : 0;
     if (!g_cpuVendor) { g_pioState = PIO_UNSUPPORTED; goto out; }
 
-    wchar_t path[MAX_PATH + 32];
-    DWORD n = GetModuleFileNameW(NULL, path, MAX_PATH);
-    while (n && path[n - 1] != L'\\') n--;
-    path[n] = 0;
-    lstrcatW(path, g_cpuVendor == 1 ? L"IntelMSR.bin" : L"AMDFamily17.bin");
-
     g_pio = CreateFileW(L"\\\\?\\GLOBALROOT\\Device\\PawnIO", GENERIC_READ | GENERIC_WRITE,
                         FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (g_pio == INVALID_HANDLE_VALUE) {
@@ -274,20 +372,11 @@ static void pio_init(void)
         goto out;
     }
 
-    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    DWORD sz = f == INVALID_HANDLE_VALUE ? 0 : GetFileSize(f, NULL), got = 0;
-    BYTE *mod = sz && sz < (8u << 20) ? HeapAlloc(GetProcessHeap(), 0, sz) : NULL;
-    const void *src = NULL;
-    int ok = mod && ReadFile(f, mod, sz, &got, NULL) && got == sz;
-    if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
-    if (ok) src = mod;
-    else {
-        HRSRC r = FindResourceW(NULL, MAKEINTRESOURCEW(g_cpuVendor == 1 ? 101 : 102), (LPCWSTR)RT_RCDATA);
-        HGLOBAL hg = r ? LoadResource(NULL, r) : NULL;
-        src = hg ? LockResource(hg) : NULL;
-        sz = r ? SizeofResource(NULL, r) : 0;
-        ok = src && sz;
-    }
+    HRSRC r = FindResourceW(NULL, MAKEINTRESOURCEW(g_cpuVendor == 1 ? 101 : 102), (LPCWSTR)RT_RCDATA);
+    HGLOBAL hg = r ? LoadResource(NULL, r) : NULL;
+    const void *src = hg ? LockResource(hg) : NULL;
+    DWORD sz = r ? SizeofResource(NULL, r) : 0, got = 0;
+    int ok = src && sz;
     if (!ok) { g_pioState = PIO_NOMODULE; }
     else if (!DeviceIoControl(g_pio, IOCTL_PIO_LOAD, (void *)src, sz, NULL, 0, &got, NULL)) g_pioState = PIO_FAILED;
     else {
@@ -298,7 +387,6 @@ static void pio_init(void)
             if (g_tjmax < 60 || g_tjmax > 130) g_tjmax = 100;
         } else if (!g_pciMutex) g_pciMutex = CreateMutexW(NULL, FALSE, L"Global\\Access_PCI");
     }
-    if (mod) HeapFree(GetProcessHeap(), 0, mod);
     if (g_pioState != PIO_OK) { CloseHandle(g_pio); g_pio = INVALID_HANDLE_VALUE; }
 out:
     LeaveCriticalSection(&g_pioCs);
@@ -382,6 +470,7 @@ static int sha256_is(const BYTE *data, DWORD len, const BYTE *want)
 static int pawnio_install(const wchar_t **msg)
 {
     DWORD len = 0, w, code = 1;
+    if (!load_net()) { *msg = L"Couldn't load the Windows networking components."; return 0; }
     BYTE *bin = http_get(PAWNIO_HOST, PAWNIO_PATH, &len);
     if (!bin) { *msg = L"Couldn't download the PawnIO installer from GitHub. Check your internet connection."; return 0; }
     if (!sha256_is(bin, len, PAWNIO_SHA256)) {
@@ -389,27 +478,28 @@ static int pawnio_install(const wchar_t **msg)
         *msg = L"The downloaded PawnIO installer didn't match its known checksum, so it was not run.";
         return 0;
     }
-    wchar_t dir[MAX_PATH], exe[MAX_PATH + 40], cmd[MAX_PATH + 80];
-    GetTempPathW(MAX_PATH - 40, dir);
-    lstrcatW(dir, L"TraySense");
-    CreateDirectoryW(dir, NULL);
-    _snwprintf(exe, MAX_PATH + 40, L"%s\\PawnIO_setup.exe", dir); exe[MAX_PATH + 39] = 0;
+    wchar_t dir[MAX_PATH], exe[MAX_PATH], cmd[MAX_PATH + 32];
+    if (!app_dir(dir)) {
+        HeapFree(GetProcessHeap(), 0, bin);
+        *msg = L"Couldn't create the TraySense folder in Program Files.";
+        return 0;
+    }
+    _snwprintf(exe, MAX_PATH, L"%s\\PawnIO_setup.exe", dir); exe[MAX_PATH - 1] = 0;
     HANDLE f = CreateFileW(exe, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     int wrote = f != INVALID_HANDLE_VALUE && WriteFile(f, bin, len, &w, NULL) && w == len;
     if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
     HeapFree(GetProcessHeap(), 0, bin);
-    if (!wrote) { *msg = L"Couldn't save the PawnIO installer to the temp folder."; return 0; }
+    if (!wrote) { DeleteFileW(exe); *msg = L"Couldn't save the PawnIO installer."; return 0; }
 
-    _snwprintf(cmd, MAX_PATH + 80, L"\"%s\" -install -silent", exe); cmd[MAX_PATH + 79] = 0;
+    _snwprintf(cmd, MAX_PATH + 32, L"\"%s\" -install -silent", exe); cmd[MAX_PATH + 31] = 0;
     STARTUPINFOW si; PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
-    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, dir, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 180000);
         GetExitCodeProcess(pi.hProcess, &code);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     }
     DeleteFileW(exe);
-    RemoveDirectoryW(dir);
     if (code != 0 && code != 3010) { *msg = L"The PawnIO installer reported an error."; return 0; }
     return 1;
 }
@@ -456,7 +546,7 @@ static void build_query(void)
 {
     if (g_q) { PdhCloseQuery(g_q); g_q = 0; }
     g_cTherm = g_cEng = g_cMem = 0;
-    if (!(g_mask & ((1u << M_CPUT) | (1u << M_GPU) | (1u << M_VRAM)))) return;
+    if (!(g_mask & ((1u << M_CPUT) | (1u << M_GPU) | (1u << M_VRAM))) || !load_pdh()) return;
     if (PdhOpenQueryW(NULL, 0, &g_q) != ERROR_SUCCESS) { g_q = 0; return; }
     if ((g_mask & (1u << M_CPUT)) && g_pioState != PIO_OK &&
         PdhAddEnglishCounterW(g_q, L"\\Thermal Zone Information(*)\\Temperature", 0, &g_cTherm)) g_cTherm = 0;
@@ -1151,16 +1241,21 @@ static DWORD reg_dword(const wchar_t *name)
     RegGetValueW(HKEY_CURRENT_USER, REGKEY, name, RRF_RT_REG_DWORD, NULL, &v, &sz);
     return v;
 }
-static void run_hidden(wchar_t *cmd)
+static void schtasks(const wchar_t *args)
 {
+    wchar_t app[MAX_PATH], cmd[MAX_PATH * 2 + 64];
+    if (!sys_path(app, L"schtasks.exe")) return;
+    _snwprintf(cmd, MAX_PATH * 2 + 64, L"\"%s\" %s", app, args); cmd[MAX_PATH * 2 + 63] = 0;
     STARTUPINFOW si; PROCESS_INFORMATION pi;
     ZeroMemory(&si, sizeof si); si.cb = sizeof si;
-    if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+    if (CreateProcessW(app, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
         WaitForSingleObject(pi.hProcess, 10000);
         CloseHandle(pi.hProcess); CloseHandle(pi.hThread);
     }
 }
 static void task_create(const wchar_t *exe);
+static void task_remove_copy(void);
+static void relaunch_admin(const wchar_t *args);
 static int autostart_on(void)
 {
     return reg_dword(L"Task") ||
@@ -1172,10 +1267,16 @@ static void autostart_toggle(void)
     DWORD n = GetModuleFileNameW(NULL, exe, MAX_PATH), zero = 0;
     if (!n || n >= MAX_PATH) return;
     if (autostart_on()) {
+        if (reg_dword(L"Task") && !is_admin()) {
+            if (MessageBoxW(g_wnd, L"TraySense starts as administrator at login. Turning that off needs administrator "
+                                   L"rights.\n\nRestart TraySense as administrator?", APP, MB_YESNO | MB_ICONQUESTION) == IDYES)
+                relaunch_admin(L"/restart");
+            return;
+        }
         RegDeleteKeyValueW(HKEY_CURRENT_USER, RUNKEY, APP);
         if (reg_dword(L"Task")) {
-            lstrcpyW(cmd, L"schtasks /Delete /F /TN TraySense");
-            run_hidden(cmd);
+            schtasks(L"/Delete /F /TN TraySense");
+            task_remove_copy();
             RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Task", REG_DWORD, &zero, sizeof zero);
         }
         return;
@@ -1188,18 +1289,52 @@ static void autostart_toggle(void)
     task_create(exe);
 }
 
+static void xml_escape(wchar_t *out, int n, const wchar_t *in)
+{
+    int o = 0;
+    for (; *in && o < n - 7; in++) {
+        const wchar_t *r = *in == L'&' ? L"&amp;" : *in == L'<' ? L"&lt;" : *in == L'>' ? L"&gt;" : NULL;
+        if (r) { lstrcpyW(out + o, r); o += lstrlenW(r); }
+        else out[o++] = *in;
+    }
+    out[o] = 0;
+}
+
+static int user_sid(wchar_t *out, int n)
+{
+    HANDLE t; BYTE b[256]; DWORD got; LPWSTR str; int ok = 0;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &t)) return 0;
+    if (GetTokenInformation(t, TokenUser, b, sizeof b, &got) && ConvertSidToStringSidW(((TOKEN_USER *)b)->User.Sid, &str)) {
+        lstrcpynW(out, str, n);
+        LocalFree(str);
+        ok = 1;
+    }
+    CloseHandle(t);
+    return ok;
+}
+
+static void task_remove_copy(void)
+{
+    wchar_t dir[MAX_PATH], dst[MAX_PATH], self[MAX_PATH];
+    if (!is_admin() || !app_dir(dir)) return;
+    _snwprintf(dst, MAX_PATH, L"%s\\TraySense.exe", dir); dst[MAX_PATH - 1] = 0;
+    GetModuleFileNameW(NULL, self, MAX_PATH);
+    if (!lstrcmpiW(self, dst) || !DeleteFileW(dst)) {
+        MoveFileExW(dst, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+        MoveFileExW(dir, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+    } else RemoveDirectoryW(dir);
+}
+
 static void task_create(const wchar_t *exe)
 {
-    wchar_t cmd[MAX_PATH * 2 + 128];
-    DWORD one = 1;
-
-    wchar_t user[260] = L"", dom[128] = L"", xmlPath[MAX_PATH], xml[2048];
-    GetEnvironmentVariableW(L"USERNAME", user, 128);
-    GetEnvironmentVariableW(L"USERDOMAIN", dom, 128);
-    if (dom[0]) { lstrcatW(dom, L"\\"); lstrcatW(dom, user); lstrcpyW(user, dom); }
-    GetTempPathW(MAX_PATH - 20, xmlPath);
-    lstrcatW(xmlPath, L"traysense_task.xml");
-    _snwprintf(xml, 2048,
+    wchar_t dir[MAX_PATH], dst[MAX_PATH], xmlPath[MAX_PATH], sid[184], esc[MAX_PATH * 5], xml[3072], args[MAX_PATH + 48];
+    DWORD one = 1, w;
+    if (!app_dir(dir) || !user_sid(sid, 184)) return;
+    _snwprintf(dst, MAX_PATH, L"%s\\TraySense.exe", dir); dst[MAX_PATH - 1] = 0;
+    if (lstrcmpiW(exe, dst) && !CopyFileW(exe, dst, FALSE)) return;
+    xml_escape(esc, MAX_PATH * 5, dst);
+    _snwprintf(xmlPath, MAX_PATH, L"%s\\task.xml", dir); xmlPath[MAX_PATH - 1] = 0;
+    _snwprintf(xml, 3072,
         L"\xFEFF<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
         L"<Task version=\"1.2\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">"
         L"<Triggers><LogonTrigger><Enabled>true</Enabled><UserId>%s</UserId></LogonTrigger></Triggers>"
@@ -1208,15 +1343,14 @@ static void task_create(const wchar_t *exe)
         L"<Settings><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"
         L"<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"
         L"<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><Priority>5</Priority></Settings>"
-        L"<Actions Context=\"Author\"><Exec><Command>%s</Command></Exec></Actions></Task>", user, user, exe);
-    xml[2047] = 0;
-    HANDLE f = CreateFileW(xmlPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, NULL);
-    DWORD w;
+        L"<Actions Context=\"Author\"><Exec><Command>%s</Command></Exec></Actions></Task>", sid, sid, esc);
+    xml[3071] = 0;
+    HANDLE f = CreateFileW(xmlPath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, 0, NULL);
     if (f == INVALID_HANDLE_VALUE) return;
     WriteFile(f, xml, lstrlenW(xml) * sizeof(wchar_t), &w, NULL);
     CloseHandle(f);
-    _snwprintf(cmd, MAX_PATH * 2 + 128, L"schtasks /Create /F /TN TraySense /XML \"%s\"", xmlPath);
-    run_hidden(cmd);
+    _snwprintf(args, MAX_PATH + 48, L"/Create /F /TN TraySense /XML \"%s\"", xmlPath); args[MAX_PATH + 47] = 0;
+    schtasks(args);
     DeleteFileW(xmlPath);
     RegDeleteKeyValueW(HKEY_CURRENT_USER, RUNKEY, APP);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Task", REG_DWORD, &one, sizeof one);
@@ -1339,7 +1473,11 @@ static LRESULT CALLBACK barproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
     switch (msg) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
     case WM_RBUTTONUP:     menu(); return 0;
-    case WM_LBUTTONUP:     ShellExecuteW(NULL, L"open", L"taskmgr.exe", NULL, NULL, SW_SHOWNORMAL); return 0;
+    case WM_LBUTTONUP: {
+        wchar_t tm[MAX_PATH];
+        if (sys_path(tm, L"taskmgr.exe")) ShellExecuteW(NULL, L"open", tm, NULL, NULL, SW_SHOWNORMAL);
+        return 0;
+    }
     case WM_NCDESTROY:     if (w == g_bar) g_bar = 0; break;
     }
     return DefWindowProcW(w, msg, wp, lp);
@@ -1387,6 +1525,12 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
 {
     (void)prev; (void)cmd; (void)show;
+    {
+        typedef BOOL (WINAPI *SDDD)(DWORD);
+        SDDD f = (SDDD)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetDefaultDllDirectories");
+        if (f) f(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        SetDllDirectoryW(L"");
+    }
     int restart = wcsstr(GetCommandLineW(), L"/restart") != NULL;
     for (int tries = 0;; tries++) {
         HANDLE mx = CreateMutexW(NULL, TRUE, L"Local\\TraySense.single");

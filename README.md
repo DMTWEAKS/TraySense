@@ -10,7 +10,7 @@ It's one C file using plain Win32, so the exe is around 100 KB and it uses a cou
 
 Works on Windows 10 and 11.
 
-PawnIO gets installed automatically when you turn on CPU temp (needed to read the CPU sensor).
+PawnIO gets installed automatically when you turn on CPU temp (needed to read the CPU sensor). Since the driver needs admin, TraySense then copies itself to Program Files and starts from there as admin on login.
 
 Temps are white when normal, orange when elevated and red when extremely high. For CPU and GPU that's 80°C and 90°C, for the SSD 65°C and 75°C.
 
@@ -20,7 +20,7 @@ Download the exe from releases and run it. Right click for settings, left click 
 
 ## Uninstall
 
-Untick "Start with Windows", exit, delete the exe. If you don't need PawnIO anymore, remove it from Settings > Apps.
+Untick "Start with Windows" (this also removes the copy in Program Files), exit, delete the exe. If you don't need PawnIO anymore, remove it from Settings > Apps.
 
 ## Building
 
