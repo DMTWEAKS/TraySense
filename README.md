@@ -30,4 +30,12 @@ Untick "Start with Windows" (this also removes the copy in Program Files), exit,
 
 ## License
 
-MIT. The PawnIO modules in `pawnio/` are LGPL-2.1, see THIRD_PARTY.md.
+Copyright (C) 2026 DMTWEAKS
+
+TraySense is licensed under the GNU AGPL-3.0, see LICENSE. You can use it, study it and modify it, but if you share a modified version (including running it as a service), you have to release your full source code under the same license and keep the copyright notice.
+
+The TraySense name and logo aren't covered by the license. If you fork it, give your fork a different name.
+
+Contributions are accepted under the same license.
+
+The PawnIO modules in `pawnio/` are LGPL-2.1, see THIRD_PARTY.md.
