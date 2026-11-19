@@ -866,10 +866,19 @@ static void tray_refresh(int force)
     }
 }
 
-static HWND    g_bar, g_tb;
-static int     g_child, g_barW, g_barH, g_dpi = 96;
-static RECT    g_lastPos;
-static wchar_t g_barSig[160];
+#define MAX_BARS 8
+typedef struct {
+    HWND wnd, tb;
+    int child, primary, W, H, compact, wideW, fontDpi, icoOK[4];
+    RECT lastPos;
+    wchar_t sig[160];
+    HFONT font, small, ico;
+} BAR;
+enum { SHOW_MAIN, SHOW_ALL, SHOW_OTHERS };
+static BAR   g_bars[MAX_BARS];
+static BAR  *bar = g_bars;
+static int   g_dpi = 96;
+static DWORD g_where = SHOW_MAIN;
 
 typedef struct { int glyph, sh, x, y, w, al, f, row; wchar_t t[8]; COLORREF c; } SEG;
 enum { G_CPU, G_RAM, G_GPU, G_DISK };
@@ -881,7 +890,7 @@ static void get_dpi(void)
     typedef UINT (WINAPI *GDW)(HWND);
     static GDW f; static int tried;
     if (!tried) { tried = 1; f = (GDW)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "GetDpiForWindow"); }
-    UINT d = (f && g_tb) ? f(g_tb) : 0;
+    UINT d = (f && bar->tb) ? f(bar->tb) : 0;
     if (!d) { HDC dc = GetDC(NULL); d = GetDeviceCaps(dc, LOGPIXELSY); ReleaseDC(NULL, dc); }
     g_dpi = d < 96 ? 96 : (int)d;
 }
@@ -921,38 +930,60 @@ static void glyph_cov(int sh, int gs, BYTE *out)
 
 static LRESULT CALLBACK barproc(HWND w, UINT msg, WPARAM wp, LPARAM lp);
 
-static void bar_create(void)
+static void bar_create(HWND tb, int primary)
 {
-    g_bar = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"TraySenseBar", L"",
-                            WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleW(NULL), NULL);
-    g_tb = FindWindowW(L"Shell_TrayWnd", NULL);
-    g_child = 0;
-    if (g_bar && g_tb) {
-        SetWindowLongPtrW(g_bar, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS);
-        if (SetParent(g_bar, g_tb)) g_child = 1;
-        else SetWindowLongPtrW(g_bar, GWL_STYLE, WS_POPUP);
+    if (bar->font) DeleteObject(bar->font);
+    if (bar->small) DeleteObject(bar->small);
+    if (bar->ico) DeleteObject(bar->ico);
+    ZeroMemory(bar, sizeof *bar);
+    bar->tb = tb;
+    bar->primary = primary;
+    bar->wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"TraySenseBar", L"",
+                               WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleW(NULL), NULL);
+    if (bar->wnd) {
+        SetWindowLongPtrW(bar->wnd, GWL_STYLE, WS_CHILD | WS_CLIPSIBLINGS);
+        if (SetParent(bar->wnd, tb)) bar->child = 1;
+        else SetWindowLongPtrW(bar->wnd, GWL_STYLE, WS_POPUP);
     }
-    ZeroMemory(&g_lastPos, sizeof g_lastPos);
-    g_barSig[0] = 0;
 }
 
 static void bar_to_popup(void)
 {
-    SetParent(g_bar, NULL);
-    SetWindowLongPtrW(g_bar, GWL_STYLE, WS_POPUP);
-    SetWindowLongPtrW(g_bar, GWL_EXSTYLE, GetWindowLongPtrW(g_bar, GWL_EXSTYLE) | WS_EX_TOPMOST);
-    g_child = 0;
-    ZeroMemory(&g_lastPos, sizeof g_lastPos);
+    SetParent(bar->wnd, NULL);
+    SetWindowLongPtrW(bar->wnd, GWL_STYLE, WS_POPUP);
+    SetWindowLongPtrW(bar->wnd, GWL_EXSTYLE, GetWindowLongPtrW(bar->wnd, GWL_EXSTYLE) | WS_EX_TOPMOST);
+    bar->child = 0;
+    ZeroMemory(&bar->lastPos, sizeof bar->lastPos);
 }
 
-static void bar_destroy(void)
+static void bar_destroy(BAR *b)
 {
-    if (g_bar && IsWindow(g_bar)) DestroyWindow(g_bar);
-    g_bar = 0;
+    HWND w = b->wnd;
+    b->wnd = NULL;
+    if (w && IsWindow(w)) DestroyWindow(w);
+    if (b->font) DeleteObject(b->font);
+    if (b->small) DeleteObject(b->small);
+    if (b->ico) DeleteObject(b->ico);
+    ZeroMemory(b, sizeof *b);
 }
 
-static volatile LONG g_scanOK, g_trayL, g_appsR;
-static int g_compact, g_wideW;
+static void bars_destroy(void)
+{
+    for (int i = 0; i < MAX_BARS; i++) bar_destroy(&g_bars[i]);
+}
+
+static int find_taskbars(HWND *out, int max)
+{
+    int n = 0;
+    HWND p = FindWindowW(L"Shell_TrayWnd", NULL), s = NULL;
+    if (p) out[n++] = p;
+    while (n < max && (s = FindWindowExW(NULL, s, L"Shell_SecondaryTrayWnd", NULL))) out[n++] = s;
+    return n;
+}
+
+typedef struct { HWND tb; LONG ok, trayL, appsR; } SCAN;
+static SCAN g_scan[MAX_BARS];
+static CRITICAL_SECTION g_scanCs;
 static IUIAutomation *g_uia;
 static IUIAutomationCacheRequest *g_uiaCache;
 static IUIAutomationCondition *g_uiaAll;
@@ -990,17 +1021,13 @@ static int starts(const wchar_t *s, const wchar_t *p)
     return s && !wcsncmp(s, p, wcslen(p));
 }
 
-static void uia_scan(void)
+static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
 {
     static RECT rc[256];
     static BYTE app[256];
-    HWND tb = FindWindowW(L"Shell_TrayWnd", NULL);
     RECT tr;
-    if (!tb || !GetWindowRect(tb, &tr) ||
-        !FindWindowExW(tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL) || !uia_init()) {
-        g_scanOK = 0;
-        return;
-    }
+    if (!GetWindowRect(tb, &tr) ||
+        !FindWindowExW(tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL)) return 0;
     IUIAutomationElement *root = NULL;
     IUIAutomationElementArray *arr = NULL;
     int n = 0, cnt = 0;
@@ -1036,37 +1063,73 @@ static void uia_scan(void)
     HWND tn = FindWindowExW(tb, NULL, L"TrayNotifyWnd", NULL);
     RECT nr;
     if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left && nr.left < trayL) trayL = nr.left;
-    if (!apps || trayL <= appsR) { g_scanOK = 0; return; }
-    InterlockedExchange(&g_appsR, appsR);
-    InterlockedExchange(&g_trayL, trayL);
-    InterlockedExchange(&g_scanOK, 1);
+    if ((primary && !apps) || trayL <= appsR) return 0;
+    *outTray = trayL;
+    *outApps = appsR;
+    return 1;
+}
+
+static void uia_scan(void)
+{
+    HWND tbs[MAX_BARS];
+    SCAN res[MAX_BARS];
+    HWND main = FindWindowW(L"Shell_TrayWnd", NULL);
+    int n = find_taskbars(tbs, MAX_BARS), ok = uia_init();
+    for (int i = 0; i < n; i++) {
+        res[i].tb = tbs[i];
+        res[i].trayL = res[i].appsR = 0;
+        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR);
+    }
+    EnterCriticalSection(&g_scanCs);
+    ZeroMemory(g_scan, sizeof g_scan);
+    memcpy(g_scan, res, sizeof res[0] * n);
+    LeaveCriticalSection(&g_scanCs);
+}
+
+static int scan_for(HWND tb, int *trayL, int *appsR)
+{
+    int ok = 0;
+    EnterCriticalSection(&g_scanCs);
+    for (int i = 0; i < MAX_BARS; i++)
+        if (g_scan[i].tb == tb && g_scan[i].ok) { *trayL = g_scan[i].trayL; *appsR = g_scan[i].appsR; ok = 1; break; }
+    LeaveCriticalSection(&g_scanCs);
+    return ok;
 }
 
 static void bar_place(void)
 {
     RECT tr, nr;
-    if (!g_bar) return;
-    if (!g_tb || !GetWindowRect(g_tb, &tr)) { ShowWindow(g_bar, SW_HIDE); return; }
-    HWND tn = FindWindowExW(g_tb, NULL, L"TrayNotifyWnd", NULL);
-    if (!tn || !GetWindowRect(tn, &nr) || nr.right <= nr.left) { nr = tr; nr.left = tr.right - SC(280); }
-    int h = tr.bottom - tr.top, scan = g_scanOK;
-    int right = (scan ? (int)g_trayL : nr.left) - SC(10) + SC(g_offset);
-    int avail = right - (scan ? (int)g_appsR + SC(6) : tr.left);
-    int compact = g_compact ? g_wideW > avail - SC(10) : g_wideW > avail;
-    if (compact != g_compact) {
-        g_compact = compact;
-        g_barSig[0] = 0;
+    if (!bar->wnd) return;
+    if (!bar->tb || !GetWindowRect(bar->tb, &tr) || tr.bottom - tr.top > tr.right - tr.left) {
+        ShowWindow(bar->wnd, SW_HIDE);
+        return;
+    }
+    get_dpi();
+    int trayL, appsR, scan = scan_for(bar->tb, &trayL, &appsR);
+    if (!scan) {
+        HWND tn = FindWindowExW(bar->tb, NULL, bar->primary ? L"TrayNotifyWnd" : L"ClockButton", NULL);
+        if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left) trayL = nr.left;
+        else trayL = tr.right - (bar->primary ? SC(280) : SC(12));
+        appsR = tr.left;
+    }
+    int h = tr.bottom - tr.top;
+    int right = trayL - SC(10) + SC(g_offset);
+    int avail = right - (scan ? appsR + SC(6) : tr.left);
+    int compact = bar->compact ? bar->wideW > avail - SC(10) : bar->wideW > avail;
+    if (compact != bar->compact) {
+        bar->compact = compact;
+        bar->sig[0] = 0;
         PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
     }
-    int x = right - g_barW, y = tr.top;
-    if (g_child) { POINT p = { x, y }; ScreenToClient(g_tb, &p); x = p.x; y = p.y; }
-    RECT want = { x, y, x + g_barW, y + h };
-    int top = g_child ? GetWindow(g_tb, GW_CHILD) == g_bar : 1;
-    if (memcmp(&want, &g_lastPos, sizeof want) || !top || !IsWindowVisible(g_bar)) {
-        SetWindowPos(g_bar, g_child ? HWND_TOP : HWND_TOPMOST, x, y, g_barW, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        g_lastPos = want;
-    } else if (!g_child)
-        SetWindowPos(g_bar, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    int x = right - bar->W, y = tr.top;
+    if (bar->child) { POINT p = { x, y }; ScreenToClient(bar->tb, &p); x = p.x; y = p.y; }
+    RECT want = { x, y, x + bar->W, y + h };
+    int top = bar->child ? GetWindow(bar->tb, GW_CHILD) == bar->wnd : 1;
+    if (memcmp(&want, &bar->lastPos, sizeof want) || !top || !IsWindowVisible(bar->wnd)) {
+        SetWindowPos(bar->wnd, bar->child ? HWND_TOP : HWND_TOPMOST, x, y, bar->W, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        bar->lastPos = want;
+    } else if (!bar->child)
+        SetWindowPos(bar->wnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 static void seg_pct(SEG *s, int m, COLORREF fg)
@@ -1116,8 +1179,6 @@ static void draw_gpu(HDC dc, int x0, int y0, int sz)
 #undef GY
 }
 
-static HFONT g_barFont, g_smallFont, g_icoFont;
-static int   g_barFontDpi, g_icoOK[4];
 static const wchar_t ICO_CH[4] = { 0xEEA1, 0xEEA0, 0, 0xEDA2 };
 static const MAT2 MAT_ID = { {0,1}, {0,0}, {0,0}, {0,1} };
 
@@ -1134,28 +1195,28 @@ static HFONT mkfont(HDC dc, const wchar_t *face, int px, int weight)
 
 static void bar_fonts(HDC dc)
 {
-    if (g_barFont && g_barFontDpi == g_dpi) return;
-    if (g_barFont) DeleteObject(g_barFont);
-    if (g_smallFont) DeleteObject(g_smallFont);
-    if (g_icoFont) DeleteObject(g_icoFont);
+    if (bar->font && bar->fontDpi == g_dpi) return;
+    if (bar->font) DeleteObject(bar->font);
+    if (bar->small) DeleteObject(bar->small);
+    if (bar->ico) DeleteObject(bar->ico);
     int tp = SC(14) * SS, sp = SC(12) * SS, ip = SC(16) * SS;
-    g_barFont = mkfont(dc, L"Segoe UI Variable Text", tp, FW_NORMAL);
-    if (!g_barFont) g_barFont = mkfont(dc, L"Segoe UI", tp, FW_NORMAL);
-    if (!g_barFont) g_barFont = CreateFontW(-tp, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Tahoma");
-    g_smallFont = mkfont(dc, L"Segoe UI Variable Text", sp, FW_NORMAL);
-    if (!g_smallFont) g_smallFont = mkfont(dc, L"Segoe UI", sp, FW_NORMAL);
-    if (!g_smallFont) g_smallFont = CreateFontW(-sp, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Tahoma");
-    g_icoFont = mkfont(dc, L"Segoe Fluent Icons", ip, FW_NORMAL);
-    if (!g_icoFont) g_icoFont = mkfont(dc, L"Segoe MDL2 Assets", ip, FW_NORMAL);
+    bar->font = mkfont(dc, L"Segoe UI Variable Text", tp, FW_NORMAL);
+    if (!bar->font) bar->font = mkfont(dc, L"Segoe UI", tp, FW_NORMAL);
+    if (!bar->font) bar->font = CreateFontW(-tp, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Tahoma");
+    bar->small = mkfont(dc, L"Segoe UI Variable Text", sp, FW_NORMAL);
+    if (!bar->small) bar->small = mkfont(dc, L"Segoe UI", sp, FW_NORMAL);
+    if (!bar->small) bar->small = CreateFontW(-sp, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Tahoma");
+    bar->ico = mkfont(dc, L"Segoe Fluent Icons", ip, FW_NORMAL);
+    if (!bar->ico) bar->ico = mkfont(dc, L"Segoe MDL2 Assets", ip, FW_NORMAL);
     for (int k = 0; k < 4; k++) {
         WORD gi = 0xFFFF;
-        g_icoOK[k] = 0;
-        if (!g_icoFont || !ICO_CH[k]) continue;
-        HGDIOBJ o = SelectObject(dc, g_icoFont);
-        if (GetGlyphIndicesW(dc, &ICO_CH[k], 1, &gi, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR && gi != 0xFFFF) g_icoOK[k] = 1;
+        bar->icoOK[k] = 0;
+        if (!bar->ico || !ICO_CH[k]) continue;
+        HGDIOBJ o = SelectObject(dc, bar->ico);
+        if (GetGlyphIndicesW(dc, &ICO_CH[k], 1, &gi, GGI_MARK_NONEXISTING_GLYPHS) != GDI_ERROR && gi != 0xFFFF) bar->icoOK[k] = 1;
         SelectObject(dc, o);
     }
-    g_barFontDpi = g_dpi;
+    bar->fontDpi = g_dpi;
 }
 
 static void ink(HDC dc, wchar_t ch, int *top, int *h, int *left, int *w)
@@ -1180,7 +1241,7 @@ static int layout(HDC dc, SEG *sg, int n, int compact, int HB)
 {
     int gs = SC(16) * SS, top, h, d1, d2, X = SC(4) * SS;
     if (!compact) {
-        SelectObject(dc, g_barFont);
+        SelectObject(dc, bar->font);
         ink(dc, L'0', &top, &h, &d1, &d2);
         for (int i = 0; i < n; i++) {
             if (sg[i].glyph) { if (i) X += SC(14) * SS; sg[i].w = gs; }
@@ -1194,7 +1255,7 @@ static int layout(HDC dc, SEG *sg, int n, int compact, int HB)
         }
         return X + SC(4) * SS;
     }
-    SelectObject(dc, g_smallFont);
+    SelectObject(dc, bar->small);
     ink(dc, L'0', &top, &h, &d1, &d2);
     int gap = SC(3) * SS, yTop = HB / 2 - gap / 2 - h - top, yBot = HB / 2 + gap / 2 - top, yMid = HB / 2 - h / 2 - top;
     for (int i = 0; i < n;) {
@@ -1224,11 +1285,11 @@ static void bar_draw(int force)
     static BYTE alOf[2][1024];
     static BYTE gc[64 * 64], lut[256];
     if (!lut[255]) for (int i = 0; i < 256; i++) lut[i] = (BYTE)(255.0 * pow(i / 255.0, 0.8) + 0.5);
-    if (!g_bar) return;
+    if (!bar->wnd) return;
     RECT tr; int H = 40;
-    if (g_tb && GetWindowRect(g_tb, &tr)) H = tr.bottom - tr.top;
+    if (bar->tb && GetWindowRect(bar->tb, &tr)) H = tr.bottom - tr.top;
     if (H < 16) H = 16;
-    if (H > 160) H = 160;
+    if (H > 400) H = 400;
     get_dpi();
     COLORREF fg = g_light ? RGB(0, 0, 0) : RGB(255, 255, 255);
 
@@ -1257,20 +1318,20 @@ static void bar_draw(int force)
         seg_temp(&sg[n++], M_DISKT, fg);
     }
 
-    wchar_t sig[160]; int p = _snwprintf(sig, 160, L"%d|%d|%d|%d|%d|", H, g_dpi, g_light, n, g_compact);
+    wchar_t sig[160]; int p = _snwprintf(sig, 160, L"%d|%d|%d|%d|%d|", H, g_dpi, g_light, n, bar->compact);
     for (int i = 0; i < n && p > 0 && p < 140; i++)
         if (!sg[i].glyph) p += _snwprintf(sig + p, 160 - p, L"%s%06X|", sg[i].t, (unsigned)sg[i].c);
     sig[159] = 0;
-    if (!force && !lstrcmpW(sig, g_barSig)) { bar_place(); return; }
-    lstrcpyW(g_barSig, sig);
+    if (!force && !lstrcmpW(sig, bar->sig)) { bar_place(); return; }
+    lstrcpyW(bar->sig, sig);
 
     HDC mdc = CreateCompatibleDC(NULL);
     bar_fonts(mdc);
     int HB = H * SS;
 
-    HGDIOBJ of = SelectObject(mdc, g_barFont);
-    g_wideW = (layout(mdc, sg, n, 0, HB) + SS - 1) / SS;
-    int W = g_compact ? (layout(mdc, sg, n, 1, HB) + SS - 1) / SS : g_wideW;
+    HGDIOBJ of = SelectObject(mdc, bar->font);
+    bar->wideW = (layout(mdc, sg, n, 0, HB) + SS - 1) / SS;
+    int W = bar->compact ? (layout(mdc, sg, n, 1, HB) + SS - 1) / SS : bar->wideW;
     if (W > 1024) W = 1024;
     int WB = W * SS;
 
@@ -1296,7 +1357,7 @@ static void bar_draw(int force)
 
     for (int i = 0; i < n; i++) {
         if (sg[i].glyph) continue;
-        SelectObject(mdc, sg[i].f ? g_smallFont : g_barFont);
+        SelectObject(mdc, sg[i].f ? bar->small : bar->font);
         TextOutW(mdc, sg[i].x, sg[i].y, sg[i].t, lstrlenW(sg[i].t));
         for (int r = 0; r < 2; r++) {
             if (sg[i].row >= 0 && sg[i].row != r) continue;
@@ -1306,9 +1367,9 @@ static void bar_draw(int force)
     }
     for (int i = 0; i < n; i++)
         if (sg[i].glyph && sg[i].sh == G_GPU) draw_gpu(mdc, sg[i].x, HB / 2 - sg[i].w / 2, sg[i].w);
-    SelectObject(mdc, g_icoFont ? g_icoFont : g_barFont);
+    SelectObject(mdc, bar->ico ? bar->ico : bar->font);
     for (int i = 0; i < n; i++) {
-        if (!sg[i].glyph || sg[i].sh == G_GPU || !g_icoOK[sg[i].sh]) continue;
+        if (!sg[i].glyph || sg[i].sh == G_GPU || !bar->icoOK[sg[i].sh]) continue;
         int top, h, left, w;
         ink(mdc, ICO_CH[sg[i].sh], &top, &h, &left, &w);
         TextOutW(mdc, sg[i].x + (sg[i].w - w) / 2 - left, HB / 2 - (top + h / 2), &ICO_CH[sg[i].sh], 1);
@@ -1333,7 +1394,7 @@ static void bar_draw(int force)
 
     int gs = SC(16), gy = (H - gs) / 2;
     for (int i = 0; i < n; i++) {
-        if (!sg[i].glyph || sg[i].sh == G_GPU || g_icoOK[sg[i].sh]) continue;
+        if (!sg[i].glyph || sg[i].sh == G_GPU || bar->icoOK[sg[i].sh]) continue;
         glyph_cov(sg[i].sh == G_CPU ? SH_CPU : SH_RAM, gs > 64 ? 64 : gs, gc);
         int X0 = sg[i].x / SS;
         for (int y = 0; y < gs && y < 64; y++)
@@ -1347,10 +1408,10 @@ static void bar_draw(int force)
 
     POINT src = { 0, 0 }; SIZE sz = { W, H };
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
-    g_barW = W; g_barH = H;
-    if (!UpdateLayeredWindow(g_bar, NULL, NULL, &sz, mdc, &src, 0, &bf, ULW_ALPHA) && g_child) {
+    bar->W = W; bar->H = H;
+    if (!UpdateLayeredWindow(bar->wnd, NULL, NULL, &sz, mdc, &src, 0, &bf, ULW_ALPHA) && bar->child) {
         bar_to_popup();
-        UpdateLayeredWindow(g_bar, NULL, NULL, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
+        UpdateLayeredWindow(bar->wnd, NULL, NULL, &sz, mdc, &src, 0, &bf, ULW_ALPHA);
     }
     SelectObject(mdc, ob);
     SelectObject(mdc, of);
@@ -1359,12 +1420,39 @@ static void bar_draw(int force)
     bar_place();
 }
 
+static int wanted(HWND tb, HWND main, int others)
+{
+    if (g_where == SHOW_ALL) return 1;
+    if (g_where == SHOW_OTHERS && others) return tb != main;
+    return tb == main;
+}
+
 static void refresh(int force)
 {
+    HWND tbs[MAX_BARS], main = FindWindowW(L"Shell_TrayWnd", NULL);
     tray_refresh(force);
-    if (g_mode != MODE_BAR) { bar_destroy(); return; }
-    if (!g_bar || !IsWindow(g_bar) || !g_tb || !IsWindow(g_tb)) { bar_destroy(); bar_create(); force = 1; }
-    bar_draw(force);
+    if (g_mode != MODE_BAR) { bars_destroy(); return; }
+    int n = find_taskbars(tbs, MAX_BARS), others = n > (main != NULL);
+    for (int i = 0; i < MAX_BARS; i++) {
+        BAR *b = &g_bars[i];
+        if (!b->wnd) continue;
+        int keep = IsWindow(b->wnd) && IsWindow(b->tb) && wanted(b->tb, main, others);
+        for (int k = 0; keep && k < n; k++) if (tbs[k] == b->tb) keep = 2;
+        if (keep != 2) bar_destroy(b);
+    }
+    for (int k = 0; k < n; k++) {
+        if (!wanted(tbs[k], main, others)) continue;
+        int have = 0, free = -1;
+        for (int i = 0; i < MAX_BARS; i++) {
+            if (g_bars[i].wnd && g_bars[i].tb == tbs[k]) have = 1;
+            else if (!g_bars[i].wnd && free < 0) free = i;
+        }
+        if (have || free < 0) continue;
+        bar = &g_bars[free];
+        bar_create(tbs[k], tbs[k] == main);
+    }
+    for (int i = 0; i < MAX_BARS; i++)
+        if (g_bars[i].wnd) { bar = &g_bars[i]; bar_draw(force); }
 }
 
 static DWORD WINAPI sampler(void *unused)
@@ -1398,6 +1486,7 @@ static void save(void)
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Interval", REG_DWORD, &g_interval, sizeof g_interval);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Mode", REG_DWORD, &g_mode, sizeof g_mode);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Offset", REG_DWORD, &g_offset, sizeof g_offset);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"ShowOn", REG_DWORD, &g_where, sizeof g_where);
 }
 static void load(void)
 {
@@ -1413,6 +1502,9 @@ static void load(void)
     sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Offset", RRF_RT_REG_DWORD, NULL, &v, &sz))
         g_offset = (LONG)v;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"ShowOn", RRF_RT_REG_DWORD, NULL, &v, &sz) && v <= SHOW_OTHERS)
+        g_where = v;
 }
 static int is_admin(void)
 {
@@ -1615,6 +1707,11 @@ static void menu(void)
     AppendMenuW(h, MF_SEPARATOR, 0, NULL);
     AppendMenuW(h, MF_STRING | (g_mode == MODE_BAR ? MF_CHECKED : 0), 310, L"Big labels on taskbar");
     if (g_mode == MODE_BAR) {
+        HMENU on = CreatePopupMenu();
+        AppendMenuW(on, MF_STRING | (g_where == SHOW_MAIN ? MF_CHECKED : 0), 330, L"Main taskbar");
+        AppendMenuW(on, MF_STRING | (g_where == SHOW_ALL ? MF_CHECKED : 0), 331, L"All taskbars");
+        AppendMenuW(on, MF_STRING | (g_where == SHOW_OTHERS ? MF_CHECKED : 0), 332, L"Other monitors only");
+        AppendMenuW(h, MF_POPUP, (UINT_PTR)on, L"Show on");
         AppendMenuW(h, MF_STRING, 311, L"Move left");
         AppendMenuW(h, MF_STRING, 312, L"Move right");
         AppendMenuW(h, MF_STRING, 313, L"Reset position");
@@ -1649,10 +1746,15 @@ static void menu(void)
     else if (cmd == 310) { g_mode = g_mode == MODE_BAR ? MODE_TRAY : MODE_BAR; refresh(1); save(); }
     else if (cmd >= 311 && cmd <= 313) {
         g_offset = cmd == 313 ? 0 : g_offset + (cmd == 311 ? -10 : 10);
-        ZeroMemory(&g_lastPos, sizeof g_lastPos);
-        bar_place();
+        for (int i = 0; i < MAX_BARS; i++)
+            if (g_bars[i].wnd) {
+                bar = &g_bars[i];
+                ZeroMemory(&bar->lastPos, sizeof bar->lastPos);
+                bar_place();
+            }
         save();
     }
+    else if (cmd >= 330 && cmd <= 332) { g_where = cmd - 330; refresh(1); save(); }
     else if (cmd == 320) cpu_temp_setup(0);
     else if (cmd == 399) DestroyWindow(g_wnd);
 }
@@ -1667,7 +1769,9 @@ static LRESULT CALLBACK barproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         if (sys_path(tm, L"taskmgr.exe")) ShellExecuteW(NULL, L"open", tm, NULL, NULL, SW_SHOWNORMAL);
         return 0;
     }
-    case WM_NCDESTROY:     if (w == g_bar) g_bar = 0; break;
+    case WM_NCDESTROY:
+        for (int i = 0; i < MAX_BARS; i++) if (g_bars[i].wnd == w) g_bars[i].wnd = NULL;
+        break;
     }
     return DefWindowProcW(w, msg, wp, lp);
 }
@@ -1697,14 +1801,13 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         return TRUE;
     case WM_DESTROY:
         for (int m = 0; m < M_N; m++) if (g_shown[m]) tray(m, NIM_DELETE);
-        bar_destroy();
+        bars_destroy();
         PostQuitMessage(0);
         return 0;
     }
     if (msg == g_taskbarCreated && msg) {
         for (int m = 0; m < M_N; m++) g_shown[m] = 0;
-        bar_destroy();
-        g_tb = 0;
+        bars_destroy();
         refresh(1);
         return 0;
     }
@@ -1739,6 +1842,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     }
 
     InitializeCriticalSection(&g_pioCs);
+    InitializeCriticalSection(&g_scanCs);
     load();
     read_env();
     init_gpu();
