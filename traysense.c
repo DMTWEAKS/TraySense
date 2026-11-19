@@ -160,16 +160,19 @@ static int app_dir(wchar_t *out)
 #define RUNKEY   L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define WM_TRAY  (WM_APP + 1)
 
-enum { M_CPU, M_CPUT, M_RAM, M_GPU, M_GPUT, M_VRAM, M_DISKT, M_N };
+enum { M_CPU, M_CPUT, M_RAM, M_GPU, M_GPUT, M_VRAM, M_DISKT, M_CPUW, M_GPUW, M_N };
 static const wchar_t *NAMES[M_N] = { L"CPU usage", L"CPU temperature", L"RAM usage",
-                                     L"GPU usage", L"GPU temperature", L"VRAM usage", L"SSD temperature" };
+                                     L"GPU usage", L"GPU temperature", L"VRAM usage", L"SSD temperature",
+                                     L"CPU power", L"GPU power" };
 
-static const COLORREF COL_D[M_N] = { RGB(80,190,255), 0, RGB(185,145,255), RGB(118,215,90), 0, RGB(118,215,90), 0 };
-static const COLORREF COL_L[M_N] = { RGB(0,100,180),  0, RGB(110,60,200),  RGB(35,135,30),  0, RGB(35,135,30), 0 };
+static const COLORREF COL_D[M_N] = { RGB(80,190,255), 0, RGB(185,145,255), RGB(118,215,90), 0, RGB(118,215,90), 0,
+                                     RGB(80,190,255), RGB(118,215,90) };
+static const COLORREF COL_L[M_N] = { RGB(0,100,180),  0, RGB(110,60,200),  RGB(35,135,30),  0, RGB(35,135,30), 0,
+                                     RGB(0,100,180), RGB(35,135,30) };
 
 static HWND     g_wnd;
 static UINT     g_taskbarCreated;
-static DWORD    g_mask = (1u << M_N) - 1, g_interval = 2000;
+static DWORD    g_mask = ((1u << M_N) - 1) & ~((1u << M_CPUW) | (1u << M_GPUW)), g_interval = 2000;
 static double   g_val[M_N];
 static int      g_ok[M_N], g_shown[M_N], g_size, g_light;
 static wchar_t  g_txt[M_N][4];
@@ -195,8 +198,10 @@ typedef struct { UINT32 PhysIdx; ULONGLONG MemFreq, MaxMemFreq, MaxMemFreqOC, Me
                  ULONG FanRPM, Power, Temperature; UCHAR PowerStateOverride; } KMT_PERF;
 #define KMTQAITYPE_ADAPTERPERFDATA 62
 typedef int (*PFN_NVTEMP)(void *, int, unsigned *);
-static PFN_NVTEMP pNvTemp;
-static void      *g_nvDev;
+typedef int (*PFN_NVPOWER)(void *, unsigned *);
+static PFN_NVTEMP  pNvTemp;
+static PFN_NVPOWER pNvPower;
+static void       *g_nvDev;
 
 static const GUID IID_F1 = {0x770aae78,0xf26f,0x4dba,{0xa8,0x29,0x25,0x3c,0x83,0xd1,0xb3,0x87}};
 static const GUID G_DISPLAY = {0x6fe69556,0x704a,0x47a0,{0x8f,0x24,0xc2,0x8d,0x93,0x6f,0xda,0x47}};
@@ -318,6 +323,32 @@ static void read_gpu_temp(void)
     else if (pNvTemp && pNvTemp(g_nvDev, 0, &nt) == 0) { g_val[M_GPUT] = nt; g_ok[M_GPUT] = 1; }
 }
 
+/* Loaded only when needed: as a fallback for GPU temp, or once GPU power is turned on. Called from the
+   UI thread only, nvmlInit needs more stack than the sampler thread has. */
+static void nvml_load(void)
+{
+    static int tried;
+    if (tried) return;
+    tried = 1;
+    HMODULE nv = sysdll(L"nvml.dll");
+    if (!nv) nv = LoadLibraryExW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll", NULL,
+                                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!nv) return;
+    int (*init)(void) = (int (*)(void))(void *)GetProcAddress(nv, "nvmlInit_v2");
+    int (*hnd)(unsigned, void **) = (int (*)(unsigned, void **))(void *)GetProcAddress(nv, "nvmlDeviceGetHandleByIndex_v2");
+    PFN_NVTEMP  tp = (PFN_NVTEMP)(void *)GetProcAddress(nv, "nvmlDeviceGetTemperature");
+    PFN_NVPOWER pw = (PFN_NVPOWER)(void *)GetProcAddress(nv, "nvmlDeviceGetPowerUsage");
+    if (init && hnd && (tp || pw) && init() == 0 && hnd(0, &g_nvDev) == 0) { pNvTemp = tp; pNvPower = pw; }
+    else FreeLibrary(nv);
+}
+
+static void read_gpu_power(void)
+{
+    unsigned mw;
+    g_ok[M_GPUW] = 0;
+    if (pNvPower && pNvPower(g_nvDev, &mw) == 0 && mw < 2000000) { g_val[M_GPUW] = mw / 1000.0; g_ok[M_GPUW] = 1; }
+}
+
 static void init_gpu(void)
 {
     HMODULE d = sysdll(L"dxgi.dll");
@@ -351,18 +382,7 @@ static void init_gpu(void)
     if (pOpen && pOpen(&o) == 0) g_kmt = o.hAdapter;
 
     double t;
-    if (!kmt_temp(&t)) {
-        HMODULE nv = sysdll(L"nvml.dll");
-        if (!nv) nv = LoadLibraryExW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll", NULL,
-                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (nv) {
-            int (*init)(void) = (int (*)(void))(void *)GetProcAddress(nv, "nvmlInit_v2");
-            int (*hnd)(unsigned, void **) = (int (*)(unsigned, void **))(void *)GetProcAddress(nv, "nvmlDeviceGetHandleByIndex_v2");
-            PFN_NVTEMP tp = (PFN_NVTEMP)(void *)GetProcAddress(nv, "nvmlDeviceGetTemperature");
-            if (init && hnd && tp && init() == 0 && hnd(0, &g_nvDev) == 0) pNvTemp = tp;
-            else FreeLibrary(nv);
-        }
-    }
+    if (!kmt_temp(&t) || (g_mask & (1u << M_GPUW))) nvml_load();
 }
 
 #define IOCTL_PIO_LOAD 0xA1B22084u
@@ -447,6 +467,35 @@ static int pio_temp(double *t)
     }
     LeaveCriticalSection(&g_pioCs);
     return ok && *t > 0 && *t < 125;
+}
+
+/* Package power from the RAPL energy counter: energy used since the last sample divided by the time
+   between them. The first sample only sets the baseline. */
+static int pio_power(double *w)
+{
+    static ULONGLONG lastE;
+    static LARGE_INTEGER lastT;
+    static int have;
+    ULONGLONG unit = 0, e = 0;
+    LARGE_INTEGER now, f;
+    int got = 0, ok = 0;
+    if (g_pioState != PIO_OK) { have = 0; return 0; }
+    EnterCriticalSection(&g_pioCs);
+    if (g_pio != INVALID_HANDLE_VALUE)
+        got = pio_exec("ioctl_read_msr", g_cpuVendor == 1 ? 0x606 : 0xC0010299, &unit) &&
+              pio_exec("ioctl_read_msr", g_cpuVendor == 1 ? 0x611 : 0xC001029B, &e);
+    LeaveCriticalSection(&g_pioCs);
+    QueryPerformanceCounter(&now);
+    if (!got) { have = 0; return 0; }
+    e &= 0xFFFFFFFF;
+    if (have) {
+        QueryPerformanceFrequency(&f);
+        double dt = (double)(now.QuadPart - lastT.QuadPart) / (double)f.QuadPart;
+        double j = (double)((e - lastE) & 0xFFFFFFFF) / (double)(1ull << ((unit >> 8) & 0x1F));
+        if (dt > 0.2 && dt < 60) { *w = j / dt; ok = *w < 1000; }
+    }
+    lastE = e; lastT = now; have = 1;
+    return ok;
 }
 
 #define PAWNIO_HOST L"github.com"
@@ -605,6 +654,11 @@ static void sample(void)
         if (pio_temp(&t)) { g_val[M_CPUT] = t; g_ok[M_CPUT] = 1; }
         else if (!g_cTherm) g_ok[M_CPUT] = 0;
     }
+    if (g_mask & (1u << M_CPUW)) {
+        double w = 0;
+        if ((g_ok[M_CPUW] = pio_power(&w))) g_val[M_CPUW] = w;
+    }
+    if (g_mask & (1u << M_GPUW)) read_gpu_power();
     if (g_mask & (1u << M_DISKT)) {
         static unsigned k;
         if (k++ % 5 == 0 || !g_ok[M_DISKT]) read_disk();
@@ -612,8 +666,9 @@ static void sample(void)
 }
 
 enum { SH_CPU, SH_RAM, SH_GPU };
-static const int SHAPE[M_N]  = { SH_CPU, SH_CPU, SH_RAM, SH_GPU, SH_GPU, SH_RAM, SH_RAM };
-static const int ISTEMP[M_N] = { 0, 1, 0, 0, 1, 0, 1 };
+static const int SHAPE[M_N]  = { SH_CPU, SH_CPU, SH_RAM, SH_GPU, SH_GPU, SH_RAM, SH_RAM, SH_CPU, SH_GPU };
+static const int ISTEMP[M_N] = { 0, 1, 0, 0, 1, 0, 1, 0, 0 };
+static const int ISPOW[M_N]  = { 0, 0, 0, 0, 0, 0, 0, 1, 1 };
 #define SS 4
 static HDC   g_ldc;
 static int   g_S;
@@ -750,7 +805,7 @@ static HICON make_icon(int m, const wchar_t *txt)
         ZeroMemory(px, (SIZE_T)S * S * 4);
         if (layer == 0) shape(sh, solid, in);
         else if (layer == 1) {
-            if (!ISTEMP[m] && g_ok[m]) {
+            if (!ISTEMP[m] && !ISPOW[m] && g_ok[m]) {
                 double p = g_val[m] < 0 ? 0 : g_val[m] > 100 ? 100 : g_val[m];
                 float y = in[3] - (in[3] - in[1]) * (float)p / 100.0f;
                 if (p > 0.5) box(in[0], y, in[2], in[3], 1);
@@ -816,6 +871,8 @@ static void tip_for(int m, wchar_t *t)
     case M_GPUT: _snwprintf(t, 128, L"GPU temp: %.0f\x00B0" L"C", g_val[m]); break;
     case M_CPUT: _snwprintf(t, 128, L"CPU temp: %.0f\x00B0" L"C", g_val[m]); break;
     case M_DISKT: _snwprintf(t, 128, L"SSD temp: %.0f\x00B0" L"C", g_val[m]); break;
+    case M_CPUW: _snwprintf(t, 128, L"CPU power: %.1f W", g_val[m]); break;
+    case M_GPUW: _snwprintf(t, 128, L"GPU power: %.1f W", g_val[m]); break;
     default:     _snwprintf(t, 128, L"CPU: %.0f%%", g_val[m]);
     }
     t[127] = 0;
@@ -871,7 +928,7 @@ typedef struct {
     HWND wnd, tb;
     int child, primary, W, H, compact, wideW, fontDpi, icoOK[4];
     RECT lastPos;
-    wchar_t sig[160];
+    wchar_t sig[256];
     HFONT font, small, ico;
 } BAR;
 enum { SHOW_MAIN, SHOW_ALL, SHOW_OTHERS };
@@ -1149,6 +1206,11 @@ static void seg_temp(SEG *s, int m, COLORREF fg)
     if (t >= crit) s->c = g_light ? RGB(200, 25, 25) : RGB(255, 75, 65);
     else if (t >= hot) s->c = g_light ? RGB(195, 95, 0) : RGB(255, 170, 55);
 }
+static void seg_watt(SEG *s, int m, COLORREF fg)
+{
+    s->glyph = 0; s->c = fg; s->al = 255;
+    _snwprintf(s->t, 8, L"%dW", (int)(g_val[m] + 0.5)); s->t[7] = 0;
+}
 static void seg_label(SEG *s, const wchar_t *t, COLORREF fg)
 {
     s->glyph = 0; s->c = fg; s->al = 150;
@@ -1293,21 +1355,24 @@ static void bar_draw(int force)
     get_dpi();
     COLORREF fg = g_light ? RGB(0, 0, 0) : RGB(255, 255, 255);
 
-    SEG sg[14]; int n = 0;
-    if ((g_mask & (1u << M_CPU)) || ((g_mask & (1u << M_CPUT)) && g_ok[M_CPUT])) {
+    SEG sg[16]; int n = 0;
+    int cpuW = (g_mask & (1u << M_CPUW)) && g_ok[M_CPUW], gpuW = (g_mask & (1u << M_GPUW)) && g_ok[M_GPUW];
+    if ((g_mask & (1u << M_CPU)) || ((g_mask & (1u << M_CPUT)) && g_ok[M_CPUT]) || cpuW) {
         sg[n].glyph = 1; sg[n].sh = G_CPU; n++;
         if (g_mask & (1u << M_CPU)) seg_pct(&sg[n++], M_CPU, fg);
         if ((g_mask & (1u << M_CPUT)) && g_ok[M_CPUT]) seg_temp(&sg[n++], M_CPUT, fg);
+        if (cpuW) seg_watt(&sg[n++], M_CPUW, fg);
     }
     if (g_mask & (1u << M_RAM)) {
         sg[n].glyph = 1; sg[n].sh = G_RAM; n++;
         seg_pct(&sg[n++], M_RAM, fg);
     }
     int gpuT = (g_mask & (1u << M_GPUT)) && g_ok[M_GPUT];
-    if ((g_mask & ((1u << M_GPU) | (1u << M_VRAM))) || gpuT) {
+    if ((g_mask & ((1u << M_GPU) | (1u << M_VRAM))) || gpuT || gpuW) {
         sg[n].glyph = 1; sg[n].sh = G_GPU; n++;
         if (g_mask & (1u << M_GPU)) seg_pct(&sg[n++], M_GPU, fg);
         if (gpuT) seg_temp(&sg[n++], M_GPUT, fg);
+        if (gpuW) seg_watt(&sg[n++], M_GPUW, fg);
         if (g_mask & (1u << M_VRAM)) {
             seg_label(&sg[n++], L"VRAM", fg);
             seg_pct(&sg[n++], M_VRAM, fg);
@@ -1318,10 +1383,10 @@ static void bar_draw(int force)
         seg_temp(&sg[n++], M_DISKT, fg);
     }
 
-    wchar_t sig[160]; int p = _snwprintf(sig, 160, L"%d|%d|%d|%d|%d|", H, g_dpi, g_light, n, bar->compact);
-    for (int i = 0; i < n && p > 0 && p < 140; i++)
-        if (!sg[i].glyph) p += _snwprintf(sig + p, 160 - p, L"%s%06X|", sg[i].t, (unsigned)sg[i].c);
-    sig[159] = 0;
+    wchar_t sig[256]; int p = _snwprintf(sig, 256, L"%d|%d|%d|%d|%d|", H, g_dpi, g_light, n, bar->compact);
+    for (int i = 0; i < n && p > 0 && p < 236; i++)
+        if (!sg[i].glyph) p += _snwprintf(sig + p, 256 - p, L"%s%06X|", sg[i].t, (unsigned)sg[i].c);
+    sig[255] = 0;
     if (!force && !lstrcmpW(sig, bar->sig)) { bar_place(); return; }
     lstrcpyW(bar->sig, sig);
 
@@ -1700,7 +1765,7 @@ static void menu(void)
         wchar_t lbl[80];
         lstrcpyW(lbl, NAMES[m]);
         if (m == M_CPUT && g_pioState == PIO_OK) lstrcatW(lbl, L"  (CPU sensor)");
-        else if ((m == M_CPUT || m == M_GPUT || m == M_DISKT) && (g_mask >> m & 1) && !g_ok[m]) lstrcatW(lbl, L"  (no sensor found)");
+        else if ((m == M_CPUT || m == M_GPUT || m == M_DISKT || ISPOW[m]) && (g_mask >> m & 1) && !g_ok[m]) lstrcatW(lbl, L"  (no sensor found)");
         AppendMenuW(h, MF_STRING | ((g_mask >> m & 1) ? MF_CHECKED : 0), 100 + m, lbl);
     }
     if (g_pioState != PIO_OK && g_pioState != PIO_UNSUPPORTED) AppendMenuW(h, MF_STRING, 320, L"Turn on CPU temperature...");
@@ -1733,6 +1798,7 @@ static void menu(void)
     if (cmd >= 100 && cmd < 100 + M_N) {
         DWORD nm = g_mask ^ (1u << (cmd - 100));
         if (!nm) return;
+        if (g_hasGpu && (nm & (1u << M_GPUW))) nvml_load();
         g_mask = nm;
         InterlockedExchange(&g_rebuild, 1);
         SetEvent(g_wake);
