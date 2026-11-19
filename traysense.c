@@ -1760,8 +1760,11 @@ static void cpu_temp_setup(int ask)
 static void menu(void)
 {
     static const DWORD iv[3] = { 1000, 2000, 5000 };
+    /* Menu order: each power entry sits under its temperature, the bit order stays as saved. */
+    static const int MENU_ORDER[M_N] = { M_CPU, M_CPUT, M_CPUW, M_RAM, M_GPU, M_GPUT, M_GPUW, M_VRAM, M_DISKT };
     HMENU h = CreatePopupMenu(), sub = CreatePopupMenu();
-    for (int m = 0; m < M_N; m++) {
+    for (int k = 0; k < M_N; k++) {
+        int m = MENU_ORDER[k];
         wchar_t lbl[80];
         lstrcpyW(lbl, NAMES[m]);
         if (m == M_CPUT && g_pioState == PIO_OK) lstrcatW(lbl, L"  (CPU sensor)");
