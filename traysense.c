@@ -835,6 +835,8 @@ static void tray(int m, DWORD op)
 enum { MODE_BAR, MODE_TRAY };
 static DWORD          g_mode = MODE_BAR;
 static LONG           g_offset;
+enum { SIDE_RIGHT, SIDE_LEFT };
+static DWORD          g_side = SIDE_RIGHT;
 static volatile int   g_paused;
 static volatile LONG  g_rebuild = 1, g_quit;
 static HANDLE         g_wake;
@@ -981,7 +983,7 @@ static int find_taskbars(HWND *out, int max)
     return n;
 }
 
-typedef struct { HWND tb; LONG ok, trayL, appsR; } SCAN;
+typedef struct { HWND tb; LONG ok, trayL, appsR, gapL, gapR; } SCAN;
 static SCAN g_scan[MAX_BARS];
 static CRITICAL_SECTION g_scanCs;
 static IUIAutomation *g_uia;
@@ -1021,7 +1023,7 @@ static int starts(const wchar_t *s, const wchar_t *p)
     return s && !wcsncmp(s, p, wcslen(p));
 }
 
-static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
+static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps, LONG *outGapL, LONG *outGapR)
 {
     static RECT rc[256];
     static BYTE app[256];
@@ -1066,6 +1068,24 @@ static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
     if ((primary && !apps) || trayL <= appsR) return 0;
     *outTray = trayL;
     *outApps = appsR;
+
+    /* Free space at the left end: the widest gap between the taskbar's left edge and the first
+       app button (on a centered taskbar that's left of Start, after Widgets if it's shown). */
+    LONG appsL = apps ? tr.right : trayL;
+    for (int i = 0; i < n; i++)
+        if (app[i] && rc[i].left < appsL) appsL = rc[i].left;
+    LONG edge = tr.left, bestL = tr.left, bestR = tr.left;
+    for (;;) {
+        int k = -1;
+        for (int i = 0; i < n; i++)
+            if (rc[i].right > edge && rc[i].left < appsL && (k < 0 || rc[i].left < rc[k].left)) k = i;
+        LONG stop = k < 0 ? appsL : (rc[k].left < edge ? edge : rc[k].left);
+        if (stop - edge > bestR - bestL) { bestL = edge; bestR = stop; }
+        if (k < 0) break;
+        edge = rc[k].right;
+    }
+    *outGapL = bestL;
+    *outGapR = bestR;
     return 1;
 }
 
@@ -1077,8 +1097,8 @@ static void uia_scan(void)
     int n = find_taskbars(tbs, MAX_BARS), ok = uia_init();
     for (int i = 0; i < n; i++) {
         res[i].tb = tbs[i];
-        res[i].trayL = res[i].appsR = 0;
-        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR);
+        res[i].trayL = res[i].appsR = res[i].gapL = res[i].gapR = 0;
+        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR, &res[i].gapL, &res[i].gapR);
     }
     EnterCriticalSection(&g_scanCs);
     ZeroMemory(g_scan, sizeof g_scan);
@@ -1086,12 +1106,16 @@ static void uia_scan(void)
     LeaveCriticalSection(&g_scanCs);
 }
 
-static int scan_for(HWND tb, int *trayL, int *appsR)
+static int scan_for(HWND tb, int *trayL, int *appsR, int *gapL, int *gapR)
 {
     int ok = 0;
     EnterCriticalSection(&g_scanCs);
     for (int i = 0; i < MAX_BARS; i++)
-        if (g_scan[i].tb == tb && g_scan[i].ok) { *trayL = g_scan[i].trayL; *appsR = g_scan[i].appsR; ok = 1; break; }
+        if (g_scan[i].tb == tb && g_scan[i].ok) {
+            *trayL = g_scan[i].trayL; *appsR = g_scan[i].appsR;
+            *gapL = g_scan[i].gapL; *gapR = g_scan[i].gapR;
+            ok = 1; break;
+        }
     LeaveCriticalSection(&g_scanCs);
     return ok;
 }
@@ -1105,7 +1129,10 @@ static void bar_place(void)
         return;
     }
     get_dpi();
-    int trayL, appsR, scan = scan_for(bar->tb, &trayL, &appsR);
+    int trayL, appsR, gapL = 0, gapR = 0, scan = scan_for(bar->tb, &trayL, &appsR, &gapL, &gapR);
+    /* The left end needs the UIA scan to know where Start / the app buttons begin. Without it, or
+       when there's no room there (e.g. a left-aligned taskbar), the bar stays next to the tray. */
+    int left = g_side == SIDE_LEFT && scan && gapR - gapL >= SC(60);
     if (!scan) {
         HWND tn = FindWindowExW(bar->tb, NULL, bar->primary ? L"TrayNotifyWnd" : L"ClockButton", NULL);
         if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left) trayL = nr.left;
@@ -1115,13 +1142,17 @@ static void bar_place(void)
     int h = tr.bottom - tr.top;
     int right = trayL - SC(10) + SC(g_offset);
     int avail = right - (scan ? appsR + SC(6) : tr.left);
+    if (left) {
+        right = gapL + SC(10) + SC(g_offset);
+        avail = gapR - SC(10) - right;
+    }
     int compact = bar->compact ? bar->wideW > avail - SC(10) : bar->wideW > avail;
     if (compact != bar->compact) {
         bar->compact = compact;
         bar->sig[0] = 0;
         PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
     }
-    int x = right - bar->W, y = tr.top;
+    int x = left ? right : right - bar->W, y = tr.top;
     if (bar->child) { POINT p = { x, y }; ScreenToClient(bar->tb, &p); x = p.x; y = p.y; }
     RECT want = { x, y, x + bar->W, y + h };
     int top = bar->child ? GetWindow(bar->tb, GW_CHILD) == bar->wnd : 1;
@@ -1487,6 +1518,7 @@ static void save(void)
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Mode", REG_DWORD, &g_mode, sizeof g_mode);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Offset", REG_DWORD, &g_offset, sizeof g_offset);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"ShowOn", REG_DWORD, &g_where, sizeof g_where);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Side", REG_DWORD, &g_side, sizeof g_side);
 }
 static void load(void)
 {
@@ -1505,6 +1537,9 @@ static void load(void)
     sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"ShowOn", RRF_RT_REG_DWORD, NULL, &v, &sz) && v <= SHOW_OTHERS)
         g_where = v;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Side", RRF_RT_REG_DWORD, NULL, &v, &sz) && v <= SIDE_LEFT)
+        g_side = v;
 }
 static int is_admin(void)
 {
@@ -1712,6 +1747,10 @@ static void menu(void)
         AppendMenuW(on, MF_STRING | (g_where == SHOW_ALL ? MF_CHECKED : 0), 331, L"All taskbars");
         AppendMenuW(on, MF_STRING | (g_where == SHOW_OTHERS ? MF_CHECKED : 0), 332, L"Other monitors only");
         AppendMenuW(h, MF_POPUP, (UINT_PTR)on, L"Show on");
+        HMENU side = CreatePopupMenu();
+        AppendMenuW(side, MF_STRING | (g_side == SIDE_RIGHT ? MF_CHECKED : 0), 340, L"Next to the tray");
+        AppendMenuW(side, MF_STRING | (g_side == SIDE_LEFT ? MF_CHECKED : 0), 341, L"Left end of the taskbar");
+        AppendMenuW(h, MF_POPUP, (UINT_PTR)side, L"Position");
         AppendMenuW(h, MF_STRING, 311, L"Move left");
         AppendMenuW(h, MF_STRING, 312, L"Move right");
         AppendMenuW(h, MF_STRING, 313, L"Reset position");
@@ -1744,8 +1783,9 @@ static void menu(void)
         save();
     } else if (cmd == 300) autostart_toggle();
     else if (cmd == 310) { g_mode = g_mode == MODE_BAR ? MODE_TRAY : MODE_BAR; refresh(1); save(); }
-    else if (cmd >= 311 && cmd <= 313) {
-        g_offset = cmd == 313 ? 0 : g_offset + (cmd == 311 ? -10 : 10);
+    else if ((cmd >= 311 && cmd <= 313) || cmd == 340 || cmd == 341) {
+        if (cmd >= 340) { g_side = cmd - 340; g_offset = 0; }
+        else g_offset = cmd == 313 ? 0 : g_offset + (cmd == 311 ? -10 : 10);
         for (int i = 0; i < MAX_BARS; i++)
             if (g_bars[i].wnd) {
                 bar = &g_bars[i];

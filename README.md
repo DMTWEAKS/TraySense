@@ -18,7 +18,7 @@ Temps are white when normal, orange when elevated and red when extremely high. F
 
 ## Usage
 
-Download the exe from [releases](https://github.com/DMTWEAKS/traysense/releases) and run it. Only get it from there, see SECURITY.md for how to check it's the real one. Right click for settings, left click opens Task Manager.
+Download the exe from [releases](https://github.com/DMTWEAKS/traysense/releases) and run it. Only get it from there, see SECURITY.md for how to check it's the real one. Right click for settings, left click opens Task Manager. Under Position you can move the bar to the left end of the taskbar instead of next to the tray (needs a centered taskbar so there's room left of Start).
 
 ## Uninstall
 
