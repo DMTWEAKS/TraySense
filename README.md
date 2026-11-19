@@ -34,8 +34,10 @@ Copyright (C) 2026 DMTWEAKS
 
 TraySense is licensed under the GNU AGPL-3.0, see LICENSE. You can use it, study it and modify it, but if you share a modified version (including running it as a service), you have to release your full source code under the same license and keep the copyright notice.
 
+Want to use TraySense code in a closed source or commercial app? That needs my written permission and a separate license, contact me first.
+
 The TraySense name and logo aren't covered by the license. If you fork it, give your fork a different name.
 
-Contributions are accepted under the same license.
+Contributions are accepted under the same license. By sending a contribution you also allow DMTWEAKS to license it under other terms, so the project can keep offering separate licenses.
 
 The PawnIO modules in `pawnio/` are LGPL-2.1, see THIRD_PARTY.md.
