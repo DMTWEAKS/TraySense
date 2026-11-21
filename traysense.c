@@ -1283,9 +1283,10 @@ static void tray_refresh(int force)
 
 #define MAX_BARS 8
 typedef struct {
-    HWND wnd, tb;
+    HWND wnd, tb, rebar;
     int child, primary, W, H, compact, wideW, fontDpi, icoOK[4];
-    RECT lastPos, grc[8];
+    RECT lastPos, rebarOrig, grc[8];
+    int rebarOrigValid;
     int ngrp, gid[8], vert;
     wchar_t sig[320];
     HFONT font, small, ico;
@@ -1361,6 +1362,11 @@ static void bar_create(HWND tb, int primary)
     ZeroMemory(bar, sizeof *bar);
     bar->tb = tb;
     bar->primary = primary;
+    if (!FindWindowExW(tb, NULL, L"Windows.UI.Composition.DesktopWindowContentBridge", NULL)) {
+        bar->rebar = FindWindowExW(tb, NULL, L"ReBarWindow32", NULL);
+        if (bar->rebar && GetWindowRect(bar->rebar, &bar->rebarOrig))
+            bar->rebarOrigValid = 1;
+    }
     bar->wnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, L"TraySenseBar", L"",
                                WS_POPUP, 0, 0, 1, 1, NULL, NULL, GetModuleHandleW(NULL), NULL);
     if (bar->wnd) {
@@ -1379,8 +1385,24 @@ static void bar_to_popup(void)
     ZeroMemory(&bar->lastPos, sizeof bar->lastPos);
 }
 
+static void bar_restore_rebar(BAR *b)
+{
+    if (!b->rebar || !b->rebarOrigValid || !IsWindow(b->rebar)) return;
+    POINT p = { b->rebarOrig.left, b->rebarOrig.top };
+    if (b->tb && IsWindow(b->tb)) ScreenToClient(b->tb, &p);
+    int w = b->rebarOrig.right - b->rebarOrig.left;
+    int h = b->rebarOrig.bottom - b->rebarOrig.top;
+    MoveWindow(b->rebar, p.x, p.y, w, h, TRUE);
+}
+
 static void bar_destroy(BAR *b)
 {
+    bar_restore_rebar(b);
+    if (b->rebar && IsWindow(b->rebar) && b->tb && IsWindow(b->tb)) {
+        RECT r;
+        if (GetClientRect(b->tb, &r))
+            PostMessageW(b->tb, WM_SIZE, SIZE_RESTORED, MAKELPARAM(r.right, r.bottom));
+    }
     HWND w = b->wnd;
     b->wnd = NULL;
     if (w && IsWindow(w)) DestroyWindow(w);
@@ -1549,6 +1571,7 @@ static void bar_place(void)
     }
     get_dpi();
     if (tr.bottom - tr.top > tr.right - tr.left) {
+        bar_restore_rebar(bar);
         HWND tn = FindWindowExW(bar->tb, NULL, bar->primary ? L"TrayNotifyWnd" : L"ClockButton", NULL);
         int bottom = tn && GetWindowRect(tn, &nr) && nr.bottom > nr.top ? nr.top : tr.bottom - SC(120);
         int x = tr.left, y = bottom - SC(10) - bar->H + SC(g_offset);
@@ -1584,6 +1607,28 @@ static void bar_place(void)
     if (pos != POS_TRAY && bar->W > avail) pos = POS_TRAY;
     int x = pos == POS_LEFT ? leftL + SC(10) : pos == POS_APPS ? gapL : gapR - bar->W;
     x += SC(g_offset);
+    if (bar->rebar && bar->rebarOrigValid && IsWindow(bar->rebar)) {
+        if (pos == POS_TRAY) {
+            POINT p = { bar->rebarOrig.left, bar->rebarOrig.top };
+            POINT edge = { x, tr.top };
+            ScreenToClient(bar->tb, &p);
+            ScreenToClient(bar->tb, &edge);
+            int originalW = bar->rebarOrig.right - bar->rebarOrig.left;
+            int originalH = bar->rebarOrig.bottom - bar->rebarOrig.top;
+            int wantedW = edge.x - p.x;
+            if (wantedW < 0) wantedW = 0;
+            if (wantedW > originalW) wantedW = originalW;
+            RECT current;
+            int currentW = GetWindowRect(bar->rebar, &current) ? current.right - current.left : -1;
+            if (currentW != wantedW)
+                MoveWindow(bar->rebar, p.x, p.y, wantedW, originalH, TRUE);
+        } else {
+            RECT current;
+            int originalW = bar->rebarOrig.right - bar->rebarOrig.left;
+            if (GetWindowRect(bar->rebar, &current) && current.right - current.left != originalW)
+                bar_restore_rebar(bar);
+        }
+    }
     int h = tr.bottom - tr.top, y = tr.top;
     if (bar->child) { POINT p = { x, y }; ScreenToClient(bar->tb, &p); x = p.x; y = p.y; }
     RECT want = { x, y, x + bar->W, y + h };
