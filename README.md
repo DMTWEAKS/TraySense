@@ -32,7 +32,7 @@ Other stuff:
 - Hover over any group to see a graph of the last few minutes
 - Position: next to the tray, after your apps or on the left side, one or two rows
 - Works on every monitor (right click > Show on) and on vertical taskbars
-- One click internet speed test (right click > Run speed test)
+- One click internet speed test (right click > Run speed test), the result shows right on the taskbar
 - Tells you when there's a new version, you download it yourself
 
 ## Usage

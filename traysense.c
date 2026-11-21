@@ -1108,6 +1108,8 @@ static volatile LONG    g_stRunning;
 static volatile LONG64  g_stBytes, g_stFirst;
 static ULONG64          g_stDeadline;
 static double           g_stDown, g_stUp;
+static ULONG64          g_stShowUntil;
+static int              g_stFailed;
 
 static DWORD WINAPI st_worker(void *arg)
 {
@@ -1231,6 +1233,8 @@ static void fmt_speed(wchar_t *out, int n, double bits)
     out[n - 1] = 0;
 }
 
+static void refresh(int force);
+
 static void speed_test(void)
 {
     DWORD one = 1, v = 0, sz = sizeof v;
@@ -1244,6 +1248,8 @@ static void speed_test(void)
         RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"SpeedTestOk", REG_DWORD, &one, sizeof one);
     }
     g_stRunning = 1;
+    g_stFailed = 0;
+    refresh(0);
     HANDLE t = CreateThread(NULL, 64 * 1024, st_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (t) CloseHandle(t);
     else g_stRunning = 0;
@@ -1296,7 +1302,8 @@ static int   g_dpi = 96;
 static DWORD g_where = SHOW_MAIN, g_pos = POS_TRAY, g_rows = ROWS_AUTO;
 
 typedef struct { int glyph, sh, x, y, w, h, al, f; wchar_t t[16]; COLORREF c; } SEG;
-enum { G_CPU, G_RAM, G_GPU, G_DISK };
+enum { G_CPU, G_RAM, G_GPU, G_DISK, G_NET };
+#define DRAWN(sh) ((sh) == G_GPU || (sh) == G_NET)
 
 static int SC(int v) { return MulDiv(v, g_dpi, 96); }
 
@@ -1621,6 +1628,24 @@ static void seg_watts(SEG *s, int m, COLORREF fg)
     _snwprintf(s->t, 16, L"%dW", (int)(g_val[m] + 0.5)); s->t[15] = 0;
 }
 
+static void draw_net(HDC dc, int x0, int y0, int sz)
+{
+    int pw = sz / 16;
+    if (pw < 1) pw = 1;
+    HPEN pen = CreatePen(PS_SOLID, pw, RGB(255, 255, 255));
+    HGDIOBJ op = SelectObject(dc, pen);
+    POINT d[] = { { x0 + sz * 5 / 16, y0 + sz * 2 / 16 }, { x0 + sz * 5 / 16, y0 + sz * 14 / 16 } };
+    POINT dh[] = { { x0 + sz * 2 / 16, y0 + sz * 11 / 16 }, { x0 + sz * 5 / 16, y0 + sz * 14 / 16 }, { x0 + sz * 8 / 16, y0 + sz * 11 / 16 } };
+    POINT u[] = { { x0 + sz * 11 / 16, y0 + sz * 14 / 16 }, { x0 + sz * 11 / 16, y0 + sz * 2 / 16 } };
+    POINT uh[] = { { x0 + sz * 8 / 16, y0 + sz * 5 / 16 }, { x0 + sz * 11 / 16, y0 + sz * 2 / 16 }, { x0 + sz * 14 / 16, y0 + sz * 5 / 16 } };
+    Polyline(dc, d, 2);
+    Polyline(dc, dh, 3);
+    Polyline(dc, u, 2);
+    Polyline(dc, uh, 3);
+    SelectObject(dc, op);
+    DeleteObject(pen);
+}
+
 static void draw_gpu(HDC dc, int x0, int y0, int sz)
 {
 #define GX(v) (x0 + (int)((v) * sz / 16.0f + 0.5f))
@@ -1717,7 +1742,8 @@ static int layout(HDC dc, SEG *sg, int n, int compact, int HB)
                 sg[i].w = sg[i].h = gs;
                 sg[i].y = HB / 2 - gs / 2;
             } else {
-                X += (sg[i - 1].glyph ? SC(6) : sg[i].al < 255 ? SC(9) : sg[i - 1].al < 255 ? SC(4) : SC(5)) * SS;
+                X += (sg[i - 1].glyph ? SC(6) : sg[i].al < 255 || sg[i].t[0] == 0x2191 ? SC(9) :
+                      sg[i - 1].al < 255 ? SC(4) : SC(5)) * SS;
                 sg[i].w = text_w(dc, sg[i].t);
                 sg[i].h = tm.tmHeight;
                 sg[i].y = HB / 2 - (top + h / 2);
@@ -1845,6 +1871,17 @@ static void bar_draw(int force)
             seg_mhz(&sg[n++], M_MEMCLK, fg);
         }
     }
+    if (g_stRunning || GetTickCount64() < g_stShowUntil) {
+        sg[n].glyph = 1; sg[n].sh = G_NET; n++;
+        if (g_stRunning) seg_label(&sg[n++], L"Testing...", fg);
+        else if (g_stFailed) seg_label(&sg[n++], L"Test failed", fg);
+        else {
+            SEG *d = &sg[n++], *u = &sg[n++];
+            d->c = u->c = fg; d->al = u->al = 255;
+            _snwprintf(d->t, 16, L"\x2193 %.0f", g_stDown / 1e6); d->t[15] = 0;
+            _snwprintf(u->t, 16, L"\x2191 %.0f Mbps", g_stUp / 1e6); u->t[15] = 0;
+        }
+    }
     int diskT = (g_mask & (1u << M_DISKT)) && g_ok[M_DISKT], diskA = (g_mask & (1u << M_DISKA)) && g_ok[M_DISKA];
     if (diskT || diskA) {
         sg[n].glyph = 1; sg[n].sh = G_DISK; n++;
@@ -1914,9 +1951,10 @@ static void bar_draw(int force)
     }
     for (int i = 0; i < n; i++)
         if (sg[i].glyph && sg[i].sh == G_GPU) draw_gpu(mdc, sg[i].x, sg[i].y, sg[i].w);
+        else if (sg[i].glyph && sg[i].sh == G_NET) draw_net(mdc, sg[i].x, sg[i].y, sg[i].w);
     SelectObject(mdc, bar->ico ? bar->ico : bar->font);
     for (int i = 0; i < n; i++) {
-        if (!sg[i].glyph || sg[i].sh == G_GPU || !bar->icoOK[sg[i].sh]) continue;
+        if (!sg[i].glyph || DRAWN(sg[i].sh) || !bar->icoOK[sg[i].sh]) continue;
         int top, h, left, w;
         ink(mdc, ICO_CH[sg[i].sh], &top, &h, &left, &w);
         TextOutW(mdc, sg[i].x + (sg[i].w - w) / 2 - left, sg[i].y + sg[i].h / 2 - (top + h / 2), &ICO_CH[sg[i].sh], 1);
@@ -1941,7 +1979,7 @@ static void bar_draw(int force)
 
     int gs = SC(16);
     for (int i = 0; i < n; i++) {
-        if (!sg[i].glyph || sg[i].sh == G_GPU || bar->icoOK[sg[i].sh]) continue;
+        if (!sg[i].glyph || DRAWN(sg[i].sh) || bar->icoOK[sg[i].sh]) continue;
         glyph_cov(sg[i].sh == G_CPU ? SH_CPU : SH_RAM, gs > 64 ? 64 : gs, gc);
         int X0 = sg[i].x / SS;
         for (int y = 0; y < gs && y < 64; y++)
@@ -2728,18 +2766,12 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"SkipVersion", REG_SZ, nv, (lstrlenW(nv) + 1) * sizeof(wchar_t));
         return 0;
     }
-    case WM_SPEEDDONE: {
-        wchar_t m[160], a[32], b[32];
+    case WM_SPEEDDONE:
         g_stRunning = 0;
-        if (wp) {
-            fmt_speed(a, 32, g_stDown);
-            fmt_speed(b, 32, g_stUp);
-            _snwprintf(m, 160, L"Download: %s\nUpload: %s", a, b);
-        } else lstrcpyW(m, L"Couldn't reach the speed test server. Check your connection and try again.");
-        m[159] = 0;
-        MessageBoxW(g_wnd, m, APP L" \x2013 Speed test", wp ? MB_ICONINFORMATION : MB_ICONWARNING);
+        g_stFailed = !wp;
+        g_stShowUntil = GetTickCount64() + (wp ? 60000 : 10000);
+        refresh(0);
         return 0;
-    }
     case WM_TRAY:
         if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP || lp == WM_CONTEXTMENU) menu();
         return 0;
