@@ -37,7 +37,7 @@ Other stuff:
 
 ## Usage
 
-Download the exe from [releases](https://github.com/DMTWEAKS/traysense/releases) and run it. Only get it from there, see SECURITY.md for how to check it's the real one. Right click for settings, left click opens Task Manager.
+Download the exe from [releases](https://github.com/DMTWEAKS/traysense/releases) and run it. Only get it from there, see SECURITY.md for how to check it's the real one. Right click for settings, left click opens Task Manager. If you turn off "Big labels on taskbar" and can't find the tray icons (Windows often hides new ones behind the ^ arrow), open TraySense again and the labels come back.
 
 ## Uninstall
 
