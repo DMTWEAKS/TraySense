@@ -2820,13 +2820,14 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     if (is_admin()) lock_self();
     int restart = wcsstr(GetCommandLineW(), L"/restart") != NULL;
     g_msgQuit = RegisterWindowMessageW(L"TraySense.Quit");
+    int replaced = 0;
     for (int tries = 0;; tries++) {
         HANDLE mx = CreateMutexW(NULL, TRUE, L"Local\\TraySense.single");
         if (GetLastError() != ERROR_ALREADY_EXISTS) break;
         CloseHandle(mx);
         if (tries == 0 && !restart) {
             HWND old = FindWindowW(APP, APP);
-            if (old) PostMessageW(old, g_msgQuit, 0, 0);
+            if (old) { PostMessageW(old, g_msgQuit, 0, 0); replaced = 1; }
         }
         if (tries > 40) {
             if (!restart)
@@ -2848,6 +2849,9 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     InitializeCriticalSection(&g_pioCs);
     InitializeCriticalSection(&g_scanCs);
     load();
+    /* Opened again while running: the user is likely looking for it, and in tray mode the icons
+       often sit hidden in the overflow, so come back as big labels. */
+    if (replaced && g_mode != MODE_BAR) { g_mode = MODE_BAR; save(); }
     read_env();
     init_gpu();
     init_disk();
