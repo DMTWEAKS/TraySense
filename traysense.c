@@ -1097,6 +1097,7 @@ static void tray(int m, DWORD op)
 enum { MODE_BAR, MODE_TRAY };
 static DWORD          g_mode = MODE_BAR;
 static LONG           g_offset;
+static DWORD          g_plate;
 static volatile int   g_paused;
 static volatile LONG  g_rebuild = 1, g_quit, g_scanDirty = 1;
 static HANDLE         g_wake;
@@ -1991,6 +1992,25 @@ static void bar_draw(int force)
             }
     }
 
+    /* Optional rounded plate in the taskbar's own colour behind everything, so the text stays
+       readable when a taskbar theme (e.g. Windhawk's Taskbar Styler) makes the bar transparent. */
+    if (g_plate) {
+        int ix = vert ? SC(4) : 0, iy = vert ? 0 : SC(4), r = SC(6);
+        int x0 = ix, x1 = W - ix, y0 = iy, y1 = H - iy;
+        COLORREF pc = g_light ? RGB(243, 243, 243) : RGB(32, 32, 32);
+        for (int y = y0; y < y1; y++)
+            for (int x = x0; x < x1; x++) {
+                int dx = x < x0 + r ? x0 + r - x : (x >= x1 - r ? x - (x1 - r - 1) : 0);
+                int dy = y < y0 + r ? y0 + r - y : (y >= y1 - r ? y - (y1 - r - 1) : 0);
+                if (dx * dx + dy * dy > r * r) continue;
+                DWORD v = px[y * W + x], a = v >> 24;
+                if (v == 0x01000000) v = a = 0;
+                DWORD k = 240 * (255 - a) / 255;
+                px[y * W + x] = ((a + k) << 24) | ((((v >> 16) & 255) + GetRValue(pc) * k / 255) << 16) |
+                                ((((v >> 8) & 255) + GetGValue(pc) * k / 255) << 8) | ((v & 255) + GetBValue(pc) * k / 255);
+            }
+    }
+
     POINT src = { 0, 0 }; SIZE sz = { W, H };
     BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
     bar->W = W; bar->H = H;
@@ -2350,6 +2370,7 @@ static void save(void)
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Position", REG_DWORD, &g_pos, sizeof g_pos);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Rows", REG_DWORD, &g_rows, sizeof g_rows);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"CheckUpdates", REG_DWORD, &g_checkUpdates, sizeof g_checkUpdates);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Background", REG_DWORD, &g_plate, sizeof g_plate);
 }
 static void load(void)
 {
@@ -2382,6 +2403,9 @@ static void load(void)
     sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"CheckUpdates", RRF_RT_REG_DWORD, NULL, &v, &sz))
         g_checkUpdates = v != 0;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Background", RRF_RT_REG_DWORD, NULL, &v, &sz))
+        g_plate = v != 0;
 }
 static int is_admin(void);
 
@@ -2639,6 +2663,7 @@ static void menu(void)
         AppendMenuW(h, MF_STRING, 311, anyVert ? L"Move up" : L"Move left");
         AppendMenuW(h, MF_STRING, 312, anyVert ? L"Move down" : L"Move right");
         AppendMenuW(h, MF_STRING, 313, L"Reset position");
+        AppendMenuW(h, MF_STRING | (g_plate ? MF_CHECKED : 0), 314, L"Background behind text (for transparent taskbars)");
     }
     AppendMenuW(sub, MF_STRING | (g_interval == 1000 ? MF_CHECKED : 0), 200, L"1 second");
     AppendMenuW(sub, MF_STRING | (g_interval == 2000 ? MF_CHECKED : 0), 201, L"2 seconds");
@@ -2684,6 +2709,7 @@ static void menu(void)
     else if (cmd >= 330 && cmd <= 332) { g_where = cmd - 330; refresh(1); save(); }
     else if (cmd >= 340 && cmd <= 342) { g_pos = cmd - 340; g_offset = 0; refresh(1); save(); }
     else if (cmd >= 350 && cmd <= 352) { g_rows = cmd - 350; refresh(1); save(); }
+    else if (cmd == 314) { g_plate = !g_plate; refresh(1); save(); }
     else if (cmd == 370) speed_test();
     else if (cmd == 380) open_link(RELEASES);
     else if (cmd == 390) open_link(X_URL);
