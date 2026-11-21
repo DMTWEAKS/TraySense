@@ -1305,6 +1305,28 @@ typedef struct { int glyph, sh, x, y, w, h, al, f; wchar_t t[16]; COLORREF c; } 
 enum { G_CPU, G_RAM, G_GPU, G_DISK, G_NET };
 #define DRAWN(sh) ((sh) == G_GPU || (sh) == G_NET)
 
+/* User order of the groups (the speed test result always follows GPU). */
+#define G_ORD 4
+static const wchar_t *GNAME[G_ORD] = { L"CPU", L"RAM", L"GPU", L"Disk" };
+static BYTE g_order[G_ORD] = { G_CPU, G_RAM, G_GPU, G_DISK };
+static const DWORD GMASK[G_ORD] = {
+    (1u << M_CPU) | (1u << M_CPUT) | (1u << M_CPUW), 1u << M_RAM,
+    (1u << M_GPU) | (1u << M_GPUT) | (1u << M_GPUW) | (1u << M_VRAM) | (1u << M_GPUCLK) | (1u << M_MEMCLK),
+    (1u << M_DISKT) | (1u << M_DISKA) };
+
+static int order_pos(int g)
+{
+    for (int i = 0; i < G_ORD; i++) if (g_order[i] == g) return i;
+    return 0;
+}
+/* Position of the next group in direction d that is turned on, so hidden groups are skipped. */
+static int order_step(int i, int d)
+{
+    for (int j = i + d; j >= 0 && j < G_ORD; j += d)
+        if (g_mask & GMASK[g_order[j]]) return j;
+    return -1;
+}
+
 static int SC(int v) { return MulDiv(v, g_dpi, 96); }
 
 static void get_dpi(void)
@@ -1841,52 +1863,62 @@ static void bar_draw(int force)
     SEG sg[24]; int n = 0;
     ZeroMemory(sg, sizeof sg);
     int cpuT = (g_mask & (1u << M_CPUT)) && g_ok[M_CPUT], cpuW = (g_mask & (1u << M_CPUW)) && g_ok[M_CPUW];
-    if ((g_mask & (1u << M_CPU)) || cpuT || cpuW) {
-        sg[n].glyph = 1; sg[n].sh = G_CPU; n++;
-        if (g_mask & (1u << M_CPU)) seg_pct(&sg[n++], M_CPU, fg);
-        if (cpuT) seg_temp(&sg[n++], M_CPUT, fg);
-        if (cpuW) seg_watts(&sg[n++], M_CPUW, fg);
-    }
-    if (g_mask & (1u << M_RAM)) {
-        sg[n].glyph = 1; sg[n].sh = G_RAM; n++;
-        seg_pct(&sg[n++], M_RAM, fg);
-    }
     int gpuT = (g_mask & (1u << M_GPUT)) && g_ok[M_GPUT], gpuW = (g_mask & (1u << M_GPUW)) && g_ok[M_GPUW];
     int gpuC = (g_mask & (1u << M_GPUCLK)) && g_ok[M_GPUCLK], memC = (g_mask & (1u << M_MEMCLK)) && g_ok[M_MEMCLK];
-    if ((g_mask & ((1u << M_GPU) | (1u << M_VRAM))) || gpuT || gpuW || gpuC || memC) {
-        sg[n].glyph = 1; sg[n].sh = G_GPU; n++;
-        if (g_mask & (1u << M_GPU)) seg_pct(&sg[n++], M_GPU, fg);
-        if (gpuT) seg_temp(&sg[n++], M_GPUT, fg);
-        if (gpuW && g_gpuPowerPct) {
-            seg_label(&sg[n++], L"TDP", fg);
-            seg_pct(&sg[n++], M_GPUW, fg);
-        } else if (gpuW) seg_watts(&sg[n++], M_GPUW, fg);
-        if (gpuC) seg_mhz(&sg[n++], M_GPUCLK, fg);
-        if (g_mask & (1u << M_VRAM)) {
-            seg_label(&sg[n++], L"VRAM", fg);
-            seg_pct(&sg[n++], M_VRAM, fg);
-        }
-        if (memC) {
-            seg_label(&sg[n++], L"Mem", fg);
-            seg_mhz(&sg[n++], M_MEMCLK, fg);
-        }
-    }
-    if (g_stRunning || GetTickCount64() < g_stShowUntil) {
-        sg[n].glyph = 1; sg[n].sh = G_NET; n++;
-        if (g_stRunning) seg_label(&sg[n++], L"Testing...", fg);
-        else if (g_stFailed) seg_label(&sg[n++], L"Test failed", fg);
-        else {
-            SEG *d = &sg[n++], *u = &sg[n++];
-            d->c = u->c = fg; d->al = u->al = 255;
-            _snwprintf(d->t, 16, L"\x2193 %.0f", g_stDown / 1e6); d->t[15] = 0;
-            _snwprintf(u->t, 16, L"\x2191 %.0f Mbps", g_stUp / 1e6); u->t[15] = 0;
-        }
-    }
     int diskT = (g_mask & (1u << M_DISKT)) && g_ok[M_DISKT], diskA = (g_mask & (1u << M_DISKA)) && g_ok[M_DISKA];
-    if (diskT || diskA) {
-        sg[n].glyph = 1; sg[n].sh = G_DISK; n++;
-        if (diskA) seg_pct(&sg[n++], M_DISKA, fg);
-        if (diskT) seg_temp(&sg[n++], M_DISKT, fg);
+    for (int o = 0; o < G_ORD; o++) switch (g_order[o]) {
+    case G_CPU:
+        if ((g_mask & (1u << M_CPU)) || cpuT || cpuW) {
+            sg[n].glyph = 1; sg[n].sh = G_CPU; n++;
+            if (g_mask & (1u << M_CPU)) seg_pct(&sg[n++], M_CPU, fg);
+            if (cpuT) seg_temp(&sg[n++], M_CPUT, fg);
+            if (cpuW) seg_watts(&sg[n++], M_CPUW, fg);
+        }
+        break;
+    case G_RAM:
+        if (g_mask & (1u << M_RAM)) {
+            sg[n].glyph = 1; sg[n].sh = G_RAM; n++;
+            seg_pct(&sg[n++], M_RAM, fg);
+        }
+        break;
+    case G_GPU:
+        if ((g_mask & ((1u << M_GPU) | (1u << M_VRAM))) || gpuT || gpuW || gpuC || memC) {
+            sg[n].glyph = 1; sg[n].sh = G_GPU; n++;
+            if (g_mask & (1u << M_GPU)) seg_pct(&sg[n++], M_GPU, fg);
+            if (gpuT) seg_temp(&sg[n++], M_GPUT, fg);
+            if (gpuW && g_gpuPowerPct) {
+                seg_label(&sg[n++], L"TDP", fg);
+                seg_pct(&sg[n++], M_GPUW, fg);
+            } else if (gpuW) seg_watts(&sg[n++], M_GPUW, fg);
+            if (gpuC) seg_mhz(&sg[n++], M_GPUCLK, fg);
+            if (g_mask & (1u << M_VRAM)) {
+                seg_label(&sg[n++], L"VRAM", fg);
+                seg_pct(&sg[n++], M_VRAM, fg);
+            }
+            if (memC) {
+                seg_label(&sg[n++], L"Mem", fg);
+                seg_mhz(&sg[n++], M_MEMCLK, fg);
+            }
+        }
+        if (g_stRunning || GetTickCount64() < g_stShowUntil) {
+            sg[n].glyph = 1; sg[n].sh = G_NET; n++;
+            if (g_stRunning) seg_label(&sg[n++], L"Testing...", fg);
+            else if (g_stFailed) seg_label(&sg[n++], L"Test failed", fg);
+            else {
+                SEG *d = &sg[n++], *u = &sg[n++];
+                d->c = u->c = fg; d->al = u->al = 255;
+                _snwprintf(d->t, 16, L"\x2193 %.0f", g_stDown / 1e6); d->t[15] = 0;
+                _snwprintf(u->t, 16, L"\x2191 %.0f Mbps", g_stUp / 1e6); u->t[15] = 0;
+            }
+        }
+        break;
+    case G_DISK:
+        if (diskT || diskA) {
+            sg[n].glyph = 1; sg[n].sh = G_DISK; n++;
+            if (diskA) seg_pct(&sg[n++], M_DISKA, fg);
+            if (diskT) seg_temp(&sg[n++], M_DISKT, fg);
+        }
+        break;
     }
 
     wchar_t sig[320]; int p = _snwprintf(sig, 320, L"%d|%d|%d|%d|%d|%d|", vert ? VW : H, vert, g_dpi, g_light, n, bar->compact);
@@ -2350,6 +2382,9 @@ static void save(void)
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Position", REG_DWORD, &g_pos, sizeof g_pos);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Rows", REG_DWORD, &g_rows, sizeof g_rows);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"CheckUpdates", REG_DWORD, &g_checkUpdates, sizeof g_checkUpdates);
+    DWORD ord = 0;
+    for (int i = 0; i < G_ORD; i++) ord |= (DWORD)g_order[i] << (8 * i);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Order", REG_DWORD, &ord, sizeof ord);
 }
 static void load(void)
 {
@@ -2382,6 +2417,12 @@ static void load(void)
     sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"CheckUpdates", RRF_RT_REG_DWORD, NULL, &v, &sz))
         g_checkUpdates = v != 0;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Order", RRF_RT_REG_DWORD, NULL, &v, &sz)) {
+        BYTE o[G_ORD]; int seen = 0;
+        for (int i = 0; i < G_ORD; i++) { o[i] = (BYTE)(v >> (8 * i)); if (o[i] < G_ORD) seen |= 1 << o[i]; }
+        if (seen == (1 << G_ORD) - 1) memcpy(g_order, o, sizeof g_order);
+    }
 }
 static int is_admin(void);
 
@@ -2633,6 +2674,17 @@ static void menu(void)
         AppendMenuW(rw, MF_STRING | (g_rows == ROWS_ONE ? MF_CHECKED : 0), 351, L"One row");
         AppendMenuW(rw, MF_STRING | (g_rows == ROWS_TWO ? MF_CHECKED : 0), 352, L"Two rows");
         AppendMenuW(h, MF_POPUP, (UINT_PTR)rw, L"Layout");
+        HMENU ord = CreatePopupMenu();
+        for (int g = 0; g < G_ORD; g++) {
+            int i = order_pos(g), on = (g_mask & GMASK[g]) != 0;
+            HMENU sm = CreatePopupMenu();
+            AppendMenuW(sm, MF_STRING | (on && order_step(i, -1) >= 0 ? 0 : MF_GRAYED), 360 + g * 2, L"Move left");
+            AppendMenuW(sm, MF_STRING | (on && order_step(i, 1) >= 0 ? 0 : MF_GRAYED), 361 + g * 2, L"Move right");
+            wchar_t lbl[16];
+            _snwprintf(lbl, 16, on ? L"%s" : L"%s (off)", GNAME[g]); lbl[15] = 0;
+            AppendMenuW(ord, MF_POPUP | (on ? 0 : MF_GRAYED), (UINT_PTR)sm, lbl);
+        }
+        AppendMenuW(h, MF_POPUP, (UINT_PTR)ord, L"Order");
 
         int anyVert = 0;
         for (int i = 0; i < MAX_BARS; i++) if (g_bars[i].wnd && g_bars[i].vert) anyVert = 1;
@@ -2684,6 +2736,13 @@ static void menu(void)
     else if (cmd >= 330 && cmd <= 332) { g_where = cmd - 330; refresh(1); save(); }
     else if (cmd >= 340 && cmd <= 342) { g_pos = cmd - 340; g_offset = 0; refresh(1); save(); }
     else if (cmd >= 350 && cmd <= 352) { g_rows = cmd - 350; refresh(1); save(); }
+    else if (cmd >= 360 && cmd < 360 + G_ORD * 2) {
+        int i = order_pos((cmd - 360) / 2), j = order_step(i, (cmd & 1) ? 1 : -1);
+        if (j >= 0) {
+            BYTE t = g_order[i]; g_order[i] = g_order[j]; g_order[j] = t;
+            refresh(1); save();
+        }
+    }
     else if (cmd == 370) speed_test();
     else if (cmd == 380) open_link(RELEASES);
     else if (cmd == 390) open_link(X_URL);
