@@ -1,7 +1,7 @@
 @echo off
 if /I "%1"=="msvc" goto msvc
 windres traysense.rc -O coff -o traysense.res || exit /b 1
-gcc -Os -s -mwindows -Wall -ffunction-sections -fdata-sections -Wl,--gc-sections traysense.c traysense.res -o TraySense.exe -lole32 -loleaut32 || exit /b 1
+gcc -Os -s -mwindows -Wall -ffunction-sections -Wl,--gc-sections traysense.c traysense.res -o TraySense.exe -lole32 -loleaut32 || exit /b 1
 goto done
 :msvc
 rc /nologo traysense.rc || exit /b 1

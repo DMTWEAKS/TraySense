@@ -39,6 +39,7 @@ typedef BOOL (WINAPI *T_WinHttpReceiveResponse)(HINTERNET, LPVOID);
 typedef BOOL (WINAPI *T_WinHttpQueryHeaders)(HINTERNET, DWORD, LPCWSTR, LPVOID, LPDWORD, LPDWORD);
 typedef BOOL (WINAPI *T_WinHttpQueryDataAvailable)(HINTERNET, LPDWORD);
 typedef BOOL (WINAPI *T_WinHttpReadData)(HINTERNET, LPVOID, DWORD, LPDWORD);
+typedef BOOL (WINAPI *T_WinHttpWriteData)(HINTERNET, LPCVOID, DWORD, LPDWORD);
 typedef BOOL (WINAPI *T_WinHttpCloseHandle)(HINTERNET);
 typedef NTSTATUS (WINAPI *T_BCryptOpenAlgorithmProvider)(BCRYPT_ALG_HANDLE *, LPCWSTR, LPCWSTR, ULONG);
 typedef NTSTATUS (WINAPI *T_BCryptCreateHash)(BCRYPT_ALG_HANDLE, BCRYPT_HASH_HANDLE *, PUCHAR, ULONG, PUCHAR, ULONG, ULONG);
@@ -50,7 +51,7 @@ typedef NTSTATUS (WINAPI *T_BCryptCloseAlgorithmProvider)(BCRYPT_ALG_HANDLE, ULO
 #define FN(n) static T_##n p_##n;
 FN(PdhOpenQueryW) FN(PdhAddEnglishCounterW) FN(PdhCollectQueryData) FN(PdhGetFormattedCounterArrayW) FN(PdhCloseQuery)
 FN(WinHttpOpen) FN(WinHttpConnect) FN(WinHttpOpenRequest) FN(WinHttpSendRequest) FN(WinHttpReceiveResponse)
-FN(WinHttpQueryHeaders) FN(WinHttpQueryDataAvailable) FN(WinHttpReadData) FN(WinHttpCloseHandle)
+FN(WinHttpQueryHeaders) FN(WinHttpQueryDataAvailable) FN(WinHttpReadData) FN(WinHttpWriteData) FN(WinHttpCloseHandle)
 FN(BCryptOpenAlgorithmProvider) FN(BCryptCreateHash) FN(BCryptHashData) FN(BCryptFinishHash)
 FN(BCryptDestroyHash) FN(BCryptCloseAlgorithmProvider)
 #undef FN
@@ -75,7 +76,8 @@ static int load_net(void)
     HMODULE w = sysdll(L"winhttp.dll"), b = sysdll(L"bcrypt.dll");
     ok = w && b && GETFN(w, WinHttpOpen) && GETFN(w, WinHttpConnect) && GETFN(w, WinHttpOpenRequest) &&
          GETFN(w, WinHttpSendRequest) && GETFN(w, WinHttpReceiveResponse) && GETFN(w, WinHttpQueryHeaders) &&
-         GETFN(w, WinHttpQueryDataAvailable) && GETFN(w, WinHttpReadData) && GETFN(w, WinHttpCloseHandle) &&
+         GETFN(w, WinHttpQueryDataAvailable) && GETFN(w, WinHttpReadData) && GETFN(w, WinHttpWriteData) &&
+         GETFN(w, WinHttpCloseHandle) &&
          GETFN(b, BCryptOpenAlgorithmProvider) && GETFN(b, BCryptCreateHash) && GETFN(b, BCryptHashData) &&
          GETFN(b, BCryptFinishHash) && GETFN(b, BCryptDestroyHash) && GETFN(b, BCryptCloseAlgorithmProvider);
     return ok;
@@ -94,6 +96,7 @@ static int load_net(void)
 #define WinHttpQueryHeaders          p_WinHttpQueryHeaders
 #define WinHttpQueryDataAvailable    p_WinHttpQueryDataAvailable
 #define WinHttpReadData              p_WinHttpReadData
+#define WinHttpWriteData             p_WinHttpWriteData
 #define WinHttpCloseHandle           p_WinHttpCloseHandle
 #define BCryptOpenAlgorithmProvider  p_BCryptOpenAlgorithmProvider
 #define BCryptCreateHash             p_BCryptCreateHash
@@ -157,19 +160,26 @@ static int app_dir(wchar_t *out)
 
 #define APP      L"TraySense"
 #define REGKEY   L"Software\\TraySense"
+#define VERSION  "1.2"
+#define RELEASES L"https://github.com/DMTWEAKS/traysense/releases/latest"
+#define X_HANDLE L"@DMQ8_2"
+#define X_URL    L"https://x.com/DMQ8_2"
 #define RUNKEY   L"Software\\Microsoft\\Windows\\CurrentVersion\\Run"
 #define WM_TRAY  (WM_APP + 1)
 
-enum { M_CPU, M_CPUT, M_RAM, M_GPU, M_GPUT, M_VRAM, M_DISKT, M_N };
+enum { M_CPU, M_CPUT, M_RAM, M_GPU, M_GPUT, M_VRAM, M_DISKT, M_CPUW, M_GPUW, M_DISKA, M_GPUCLK, M_MEMCLK, M_N };
+#define M_TRAYN (M_DISKT + 1)
 static const wchar_t *NAMES[M_N] = { L"CPU usage", L"CPU temperature", L"RAM usage",
-                                     L"GPU usage", L"GPU temperature", L"VRAM usage", L"SSD temperature" };
+                                     L"GPU usage", L"GPU temperature", L"VRAM usage", L"SSD temperature",
+                                     L"CPU power", L"GPU power", L"Storage utilization",
+                                     L"GPU clock", L"VRAM clock" };
 
 static const COLORREF COL_D[M_N] = { RGB(80,190,255), 0, RGB(185,145,255), RGB(118,215,90), 0, RGB(118,215,90), 0 };
 static const COLORREF COL_L[M_N] = { RGB(0,100,180),  0, RGB(110,60,200),  RGB(35,135,30),  0, RGB(35,135,30), 0 };
 
 static HWND     g_wnd;
-static UINT     g_taskbarCreated;
-static DWORD    g_mask = (1u << M_N) - 1, g_interval = 2000;
+static UINT     g_taskbarCreated, g_msgQuit;
+static DWORD    g_mask = ((1u << M_TRAYN) - 1) & ~(1u << M_VRAM), g_interval = 2000;
 static double   g_val[M_N];
 static int      g_ok[M_N], g_shown[M_N], g_size, g_light;
 static wchar_t  g_txt[M_N][4];
@@ -178,7 +188,7 @@ static wchar_t  g_gpuName[64];
 static double   g_ramUsed, g_ramTotal, g_vramUsed;
 
 static PDH_HQUERY   g_q;
-static PDH_HCOUNTER g_cTherm, g_cEng, g_cMem;
+static PDH_HCOUNTER g_cTherm, g_cEng, g_cMem, g_cDisk;
 static BYTE        *g_buf;
 static DWORD        g_bufSz;
 
@@ -193,9 +203,38 @@ typedef struct { LUID Luid; UINT hAdapter; } KMT_OPEN;
 typedef struct { UINT hAdapter; UINT Type; void *pData; UINT Size; } KMT_QAI;
 typedef struct { UINT32 PhysIdx; ULONGLONG MemFreq, MaxMemFreq, MaxMemFreqOC, MemBw, PcieBw;
                  ULONG FanRPM, Power, Temperature; UCHAR PowerStateOverride; } KMT_PERF;
+#define KMTQAITYPE_NODEPERFDATA 61
 #define KMTQAITYPE_ADAPTERPERFDATA 62
+typedef struct { UINT32 Node, PhysIdx; ULONGLONG Freq, MaxFreq, MaxFreqOC; ULONG Volt, VoltMax, VoltMaxOC; ULONGLONG Latency; } KMT_NODE;
 typedef int (*PFN_NVTEMP)(void *, int, unsigned *);
+typedef int (*PFN_NVPOWER)(void *, unsigned *);
+typedef int (*PFN_NVENERGY)(void *, unsigned long long *);
+typedef struct { unsigned fieldId, scopeId; long long timestamp, latencyUsec; int valueType, nvmlReturn;
+                 union { double d; unsigned ui; unsigned long ul; unsigned long long ull; long long sll; } value; } NV_FIELD;
+typedef int (*PFN_NVFIELDS)(void *, int, NV_FIELD *);
+#define NVML_FI_DEV_POWER_INSTANT 186
+#define NVML_FI_DEV_POWER_AVERAGE 185
 static PFN_NVTEMP pNvTemp;
+static PFN_NVPOWER pNvPower;
+static PFN_NVENERGY pNvEnergy;
+static PFN_NVFIELDS pNvFields;
+typedef int (*PFN_NVCLOCK)(void *, int, unsigned *);
+static PFN_NVCLOCK pNvClock;
+static unsigned    g_nvField;
+static UINT       g_gpuVendor;
+static int        g_gpuPowerPct, g_kmtPower;
+
+typedef struct { int supported, value; } ADL_SENSOR;
+typedef struct { int size; ADL_SENSOR sensors[256]; } ADL_PMLOG;
+typedef void *(__stdcall *ADL_MALLOC)(int);
+typedef int (*T_ADL2_Create)(ADL_MALLOC, int, void **);
+typedef int (*T_ADL2_Count)(void *, int *);
+typedef int (*T_ADL2_PMLog)(void *, int, ADL_PMLOG *);
+#define ADL_ASIC_POWER  23
+#define ADL_BOARD_POWER 73
+static T_ADL2_PMLog pAdlPMLog;
+static void *g_adl;
+static int   g_adlIndex = -1;
 static void      *g_nvDev;
 
 static const GUID IID_F1 = {0x770aae78,0xf26f,0x4dba,{0xa8,0x29,0x25,0x3c,0x83,0xd1,0xb3,0x87}};
@@ -300,12 +339,64 @@ static void read_vram(void)
     g_ok[M_VRAM] = 1;
 }
 
-static int kmt_temp(double *t)
+static void *__stdcall adl_alloc(int size)
+{
+    return HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, size > 0 ? (SIZE_T)size : 1);
+}
+
+static int adl_query(ADL_PMLOG *log)
+{
+    if (!pAdlPMLog || g_adlIndex < 0) return 0;
+    ZeroMemory(log, sizeof *log);
+    log->size = sizeof *log;
+    return pAdlPMLog(g_adl, g_adlIndex, log) == 0;
+}
+
+static int adl_power(ADL_PMLOG *log, double *w)
+{
+    if (!adl_query(log)) return 0;
+    if (log->sensors[ADL_BOARD_POWER].supported && log->sensors[ADL_BOARD_POWER].value > 0)
+        *w = log->sensors[ADL_BOARD_POWER].value;
+    else if (log->sensors[ADL_ASIC_POWER].supported && log->sensors[ADL_ASIC_POWER].value > 0)
+        *w = log->sensors[ADL_ASIC_POWER].value;
+    else return 0;
+    return 1;
+}
+
+static void init_adl(void)
+{
+    static ADL_PMLOG log;
+    HMODULE m = sysdll(L"atiadlxx.dll");
+    if (!m) return;
+    T_ADL2_Create create = (T_ADL2_Create)(void *)GetProcAddress(m, "ADL2_Main_Control_Create");
+    T_ADL2_Count count = (T_ADL2_Count)(void *)GetProcAddress(m, "ADL2_Adapter_NumberOfAdapters_Get");
+    pAdlPMLog = (T_ADL2_PMLog)(void *)GetProcAddress(m, "ADL2_New_QueryPMLogData_Get");
+    int n = 0;
+    if (!create || !count || !pAdlPMLog || create(adl_alloc, 1, &g_adl) != 0 || !g_adl || count(g_adl, &n) != 0) {
+        pAdlPMLog = NULL;
+        return;
+    }
+    double w;
+    for (int i = 0; i < n && i < 64; i++) {
+        g_adlIndex = i;
+        if (adl_power(&log, &w)) return;
+    }
+    g_adlIndex = -1;
+    pAdlPMLog = NULL;
+}
+
+static int kmt_perf(KMT_PERF *p)
 {
     if (!g_kmt || !pKmtQuery) return 0;
-    KMT_PERF p; ZeroMemory(&p, sizeof p);
-    KMT_QAI q = { g_kmt, KMTQAITYPE_ADAPTERPERFDATA, &p, sizeof p };
-    if (pKmtQuery(&q) != 0 || p.Temperature == 0) return 0;
+    ZeroMemory(p, sizeof *p);
+    KMT_QAI q = { g_kmt, KMTQAITYPE_ADAPTERPERFDATA, p, sizeof *p };
+    return pKmtQuery(&q) == 0;
+}
+
+static int kmt_temp(double *t)
+{
+    KMT_PERF p;
+    if (!kmt_perf(&p) || p.Temperature == 0) return 0;
     *t = p.Temperature / 10.0;
     return 1;
 }
@@ -316,6 +407,70 @@ static void read_gpu_temp(void)
     g_ok[M_GPUT] = 0;
     if (kmt_temp(&t)) { g_val[M_GPUT] = t; g_ok[M_GPUT] = 1; }
     else if (pNvTemp && pNvTemp(g_nvDev, 0, &nt) == 0) { g_val[M_GPUT] = nt; g_ok[M_GPUT] = 1; }
+}
+
+typedef struct { int Version; WCHAR Name[MAX_PATH]; } KMT_UMD;
+#define KMTQAITYPE_UMDRIVERNAME 1
+
+static HMODULE nvml_from_driver_store(void)
+{
+    KMT_UMD u;
+    wchar_t path[MAX_PATH + 16];
+    if (!g_kmt || !pKmtQuery) return NULL;
+    ZeroMemory(&u, sizeof u);
+    u.Version = 2;
+    KMT_QAI q = { g_kmt, KMTQAITYPE_UMDRIVERNAME, &u, sizeof u };
+    if (pKmtQuery(&q) != 0 || !u.Name[0]) return NULL;
+    lstrcpynW(path, u.Name, MAX_PATH);
+    int n = lstrlenW(path);
+    while (n && path[n - 1] != L'\\') n--;
+    if (!n || _wcsnicmp(path, L"C:\\Windows\\System32\\DriverStore\\", 31) != 0) return NULL;
+    lstrcpyW(path + n, L"nvml.dll");
+    return LoadLibraryExW(path, NULL, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+}
+
+static int nv_field_power(double *w)
+{
+    NV_FIELD f;
+    if (!pNvFields) return 0;
+    ZeroMemory(&f, sizeof f);
+    f.fieldId = g_nvField;
+    if (pNvFields(g_nvDev, 1, &f) != 0 || f.nvmlReturn != 0 || !f.value.ui) return 0;
+    *w = f.value.ui / 1000.0;
+    return 1;
+}
+
+static void init_nvml(void)
+{
+    HMODULE nv = sysdll(L"nvml.dll");
+    if (!nv) nv = nvml_from_driver_store();
+    if (!nv) nv = LoadLibraryExW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll", NULL,
+                                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!nv) return;
+    int (*init)(void) = (int (*)(void))(void *)GetProcAddress(nv, "nvmlInit_v2");
+    int (*hnd)(unsigned, void **) = (int (*)(unsigned, void **))(void *)GetProcAddress(nv, "nvmlDeviceGetHandleByIndex_v2");
+    PFN_NVTEMP tp = (PFN_NVTEMP)(void *)GetProcAddress(nv, "nvmlDeviceGetTemperature");
+    if (!init || !hnd || !tp || init() != 0) { FreeLibrary(nv); return; }
+    if (hnd(0, &g_nvDev) != 0) return;
+    pNvTemp = tp;
+    pNvClock = (PFN_NVCLOCK)(void *)GetProcAddress(nv, "nvmlDeviceGetClockInfo");
+    unsigned mw;
+    unsigned long long mj;
+    pNvPower = (PFN_NVPOWER)(void *)GetProcAddress(nv, "nvmlDeviceGetPowerUsage");
+    if (pNvPower && pNvPower(g_nvDev, &mw) != 0) pNvPower = NULL;
+    if (!pNvPower) {
+        pNvEnergy = (PFN_NVENERGY)(void *)GetProcAddress(nv, "nvmlDeviceGetTotalEnergyConsumption");
+        if (pNvEnergy && pNvEnergy(g_nvDev, &mj) != 0) pNvEnergy = NULL;
+    }
+    if (!pNvPower && !pNvEnergy) {
+        double w;
+        pNvFields = (PFN_NVFIELDS)(void *)GetProcAddress(nv, "nvmlDeviceGetFieldValues");
+        g_nvField = NVML_FI_DEV_POWER_INSTANT;
+        if (!nv_field_power(&w)) {
+            g_nvField = NVML_FI_DEV_POWER_AVERAGE;
+            if (!nv_field_power(&w)) pNvFields = NULL;
+        }
+    }
 }
 
 static void init_gpu(void)
@@ -332,6 +487,7 @@ static void init_gpu(void)
                 if (SUCCEEDED(IDXGIAdapter1_GetDesc1(a, &dd)) && !(dd.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)
                     && dd.VendorId != 0x1414 && (!g_hasGpu || dd.DedicatedVideoMemory > g_vramTotal)) {
                     g_vramTotal = dd.DedicatedVideoMemory;
+                    g_gpuVendor = dd.VendorId;
                     g_luid = dd.AdapterLuid;
                     g_hasGpu = 1;
                     lstrcpynW(g_gpuName, dd.Description, 64);
@@ -351,18 +507,10 @@ static void init_gpu(void)
     if (pOpen && pOpen(&o) == 0) g_kmt = o.hAdapter;
 
     double t;
-    if (!kmt_temp(&t)) {
-        HMODULE nv = sysdll(L"nvml.dll");
-        if (!nv) nv = LoadLibraryExW(L"C:\\Program Files\\NVIDIA Corporation\\NVSMI\\nvml.dll", NULL,
-                                     LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32);
-        if (nv) {
-            int (*init)(void) = (int (*)(void))(void *)GetProcAddress(nv, "nvmlInit_v2");
-            int (*hnd)(unsigned, void **) = (int (*)(unsigned, void **))(void *)GetProcAddress(nv, "nvmlDeviceGetHandleByIndex_v2");
-            PFN_NVTEMP tp = (PFN_NVTEMP)(void *)GetProcAddress(nv, "nvmlDeviceGetTemperature");
-            if (init && hnd && tp && init() == 0 && hnd(0, &g_nvDev) == 0) pNvTemp = tp;
-            else FreeLibrary(nv);
-        }
-    }
+    KMT_PERF kp;
+    g_kmtPower = kmt_perf(&kp) && kp.Power > 0;
+    if (g_gpuVendor == 0x1002) init_adl();
+    if (!kmt_temp(&t) || g_gpuVendor == 0x10DE) init_nvml();
 }
 
 #define IOCTL_PIO_LOAD 0xA1B22084u
@@ -578,8 +726,8 @@ static void read_disk(void)
 static void build_query(void)
 {
     if (g_q) { PdhCloseQuery(g_q); g_q = 0; }
-    g_cTherm = g_cEng = g_cMem = 0;
-    if (!(g_mask & ((1u << M_CPUT) | (1u << M_GPU) | (1u << M_VRAM))) || !load_pdh()) return;
+    g_cTherm = g_cEng = g_cMem = g_cDisk = 0;
+    if (!(g_mask & ((1u << M_CPUT) | (1u << M_GPU) | (1u << M_VRAM) | (1u << M_DISKA))) || !load_pdh()) return;
     if (PdhOpenQueryW(NULL, 0, &g_q) != ERROR_SUCCESS) { g_q = 0; return; }
     if ((g_mask & (1u << M_CPUT)) && g_pioState != PIO_OK &&
         PdhAddEnglishCounterW(g_q, L"\\Thermal Zone Information(*)\\Temperature", 0, &g_cTherm)) g_cTherm = 0;
@@ -587,7 +735,117 @@ static void build_query(void)
         PdhAddEnglishCounterW(g_q, L"\\GPU Engine(*)\\Utilization Percentage", 0, &g_cEng)) g_cEng = 0;
     if (g_hasGpu && (g_mask & (1u << M_VRAM)) &&
         PdhAddEnglishCounterW(g_q, L"\\GPU Adapter Memory(*)\\Dedicated Usage", 0, &g_cMem)) g_cMem = 0;
+    if ((g_mask & (1u << M_DISKA)) &&
+        PdhAddEnglishCounterW(g_q, L"\\PhysicalDisk(*)\\% Idle Time", 0, &g_cDisk)) g_cDisk = 0;
     PdhCollectQueryData(g_q);
+}
+
+static void read_cpu_power(void)
+{
+    static ULONG64 lastE, lastT;
+    static double unit;
+    ULONGLONG v = 0;
+    int ok = 0;
+    if (g_pioState != PIO_OK) { g_ok[M_CPUW] = 0; return; }
+    EnterCriticalSection(&g_pioCs);
+    if (g_pio != INVALID_HANDLE_VALUE) {
+        int intel = g_cpuVendor == 1;
+        if (!unit && pio_exec("ioctl_read_msr", intel ? 0x606 : 0xC0010299, &v))
+            unit = 1.0 / (double)(1ull << ((v >> 8) & 0x1F));
+        if (unit && pio_exec("ioctl_read_msr", intel ? 0x611 : 0xC001029B, &v)) ok = 1;
+    }
+    LeaveCriticalSection(&g_pioCs);
+    if (!ok) { g_ok[M_CPUW] = 0; return; }
+    ULONG64 e = v & 0xFFFFFFFFull, now = GetTickCount64();
+    if (lastT && now > lastT) {
+        double w = (double)((e - lastE) & 0xFFFFFFFFull) * unit / ((now - lastT) / 1000.0);
+        if (w >= 0 && w < 1000) { g_val[M_CPUW] = w; g_ok[M_CPUW] = 1; }
+    }
+    lastE = e; lastT = now;
+}
+
+static void read_gpu_power(void)
+{
+    static ADL_PMLOG log;
+    static unsigned long long lastMj, lastT;
+    unsigned long long mj;
+    unsigned mw;
+    double w;
+    KMT_PERF p;
+    g_ok[M_GPUW] = 0;
+    if (pNvPower && pNvPower(g_nvDev, &mw) == 0) {
+        g_val[M_GPUW] = mw / 1000.0;
+        g_gpuPowerPct = 0;
+        g_ok[M_GPUW] = 1;
+    } else if (nv_field_power(&w)) {
+        g_val[M_GPUW] = w;
+        g_gpuPowerPct = 0;
+        g_ok[M_GPUW] = 1;
+    } else if (pNvEnergy && pNvEnergy(g_nvDev, &mj) == 0) {
+        unsigned long long now = GetTickCount64();
+        if (lastT && now > lastT && mj >= lastMj) {
+            g_val[M_GPUW] = (double)(mj - lastMj) / (double)(now - lastT);
+            g_gpuPowerPct = 0;
+            g_ok[M_GPUW] = 1;
+        }
+        lastMj = mj; lastT = now;
+    } else if (adl_power(&log, &w)) {
+        g_val[M_GPUW] = w;
+        g_gpuPowerPct = 0;
+        g_ok[M_GPUW] = 1;
+    } else if (g_kmtPower && kmt_perf(&p) && p.Power > 0 && p.Power <= 2000) {
+        g_val[M_GPUW] = p.Power / 10.0;
+        g_gpuPowerPct = 1;
+        g_ok[M_GPUW] = 1;
+    }
+}
+
+static void read_gpu_clocks(void)
+{
+    static ADL_PMLOG log;
+    unsigned mhz;
+    KMT_PERF p;
+    KMT_NODE nd;
+    int wantCore = g_mask >> M_GPUCLK & 1, wantMem = g_mask >> M_MEMCLK & 1, adl = 0;
+    g_ok[M_GPUCLK] = g_ok[M_MEMCLK] = 0;
+    if (pNvClock) {
+        if (wantCore && pNvClock(g_nvDev, 0, &mhz) == 0 && mhz) { g_val[M_GPUCLK] = mhz; g_ok[M_GPUCLK] = 1; }
+        if (wantMem && pNvClock(g_nvDev, 2, &mhz) == 0 && mhz) { g_val[M_MEMCLK] = mhz; g_ok[M_MEMCLK] = 1; }
+    }
+    if ((wantCore && !g_ok[M_GPUCLK]) || (wantMem && !g_ok[M_MEMCLK])) adl = adl_query(&log);
+    if (adl) {
+        if (wantCore && !g_ok[M_GPUCLK] && log.sensors[1].supported && log.sensors[1].value > 0) {
+            g_val[M_GPUCLK] = log.sensors[1].value; g_ok[M_GPUCLK] = 1;
+        }
+        if (wantMem && !g_ok[M_MEMCLK] && log.sensors[2].supported && log.sensors[2].value > 0) {
+            g_val[M_MEMCLK] = log.sensors[2].value; g_ok[M_MEMCLK] = 1;
+        }
+    }
+    if (wantCore && !g_ok[M_GPUCLK] && g_kmt && pKmtQuery) {
+        ZeroMemory(&nd, sizeof nd);
+        KMT_QAI q = { g_kmt, KMTQAITYPE_NODEPERFDATA, &nd, sizeof nd };
+        if (pKmtQuery(&q) == 0 && nd.Freq >= 1000000) { g_val[M_GPUCLK] = nd.Freq / 1e6; g_ok[M_GPUCLK] = 1; }
+    }
+    if (wantMem && !g_ok[M_MEMCLK] && kmt_perf(&p) && p.MemFreq >= 1000000) {
+        g_val[M_MEMCLK] = p.MemFreq / 1e6; g_ok[M_MEMCLK] = 1;
+    }
+}
+
+static void read_disk_activity(void)
+{
+    DWORD n;
+    wchar_t drive[4] = L"C:", win[MAX_PATH];
+    if (GetWindowsDirectoryW(win, MAX_PATH) >= 2) drive[0] = win[0];
+    PDH_FMT_COUNTERVALUE_ITEM_W *it = pdh_items(g_cDisk, &n);
+    g_ok[M_DISKA] = 0;
+    if (!it) return;
+    for (DWORD i = 0; i < n; i++) {
+        if (!good(&it[i]) || !wcsstr(it[i].szName, drive)) continue;
+        double busy = 100.0 - it[i].FmtValue.doubleValue;
+        g_val[M_DISKA] = busy < 0 ? 0 : busy > 100 ? 100 : busy;
+        g_ok[M_DISKA] = 1;
+        return;
+    }
 }
 
 static void sample(void)
@@ -598,6 +856,7 @@ static void sample(void)
         if (g_cTherm) read_therm();
         if (g_cEng)   read_gpu_usage();
         if (g_cMem)   read_vram();
+        if (g_cDisk)  read_disk_activity();
     }
     if (g_mask & (1u << M_GPUT)) read_gpu_temp();
     if (g_mask & (1u << M_CPUT)) {
@@ -609,11 +868,14 @@ static void sample(void)
         static unsigned k;
         if (k++ % 5 == 0 || !g_ok[M_DISKT]) read_disk();
     }
+    if (g_mask & (1u << M_CPUW)) read_cpu_power();
+    if (g_mask & (1u << M_GPUW)) read_gpu_power();
+    if (g_mask & ((1u << M_GPUCLK) | (1u << M_MEMCLK))) read_gpu_clocks();
 }
 
 enum { SH_CPU, SH_RAM, SH_GPU };
-static const int SHAPE[M_N]  = { SH_CPU, SH_CPU, SH_RAM, SH_GPU, SH_GPU, SH_RAM, SH_RAM };
-static const int ISTEMP[M_N] = { 0, 1, 0, 0, 1, 0, 1 };
+static const int SHAPE[M_TRAYN]  = { SH_CPU, SH_CPU, SH_RAM, SH_GPU, SH_GPU, SH_RAM, SH_RAM };
+static const int ISTEMP[M_TRAYN] = { 0, 1, 0, 0, 1, 0, 1 };
 #define SS 4
 static HDC   g_ldc;
 static int   g_S;
@@ -836,13 +1098,160 @@ enum { MODE_BAR, MODE_TRAY };
 static DWORD          g_mode = MODE_BAR;
 static LONG           g_offset;
 static volatile int   g_paused;
-static volatile LONG  g_rebuild = 1, g_quit;
+static volatile LONG  g_rebuild = 1, g_quit, g_scanDirty = 1;
 static HANDLE         g_wake;
 #define WM_SAMPLED (WM_APP + 2)
+#define WM_SPEEDDONE (WM_APP + 3)
+
+#define ST_HOST L"speed.cloudflare.com"
+static volatile LONG    g_stRunning;
+static volatile LONG64  g_stBytes, g_stFirst;
+static ULONG64          g_stDeadline;
+static double           g_stDown, g_stUp;
+
+static DWORD WINAPI st_worker(void *arg)
+{
+    static BYTE blank[65536];
+    int up = arg != NULL;
+    HINTERNET s = WinHttpOpen(L"TraySense", 4, NULL, NULL, 0);
+    if (!s) s = WinHttpOpen(L"TraySense", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, NULL, NULL, 0);
+    HINTERNET c = s ? WinHttpConnect(s, ST_HOST, INTERNET_DEFAULT_HTTPS_PORT, 0) : NULL;
+    HINTERNET r = c ? WinHttpOpenRequest(c, up ? L"POST" : L"GET", up ? L"/__up" : L"/__down?bytes=60000000",
+                                         NULL, NULL, NULL, WINHTTP_FLAG_SECURE) : NULL;
+    if (r && !up && WinHttpSendRequest(r, NULL, 0, NULL, 0, 0, 0) && WinHttpReceiveResponse(r, NULL)) {
+        BYTE *buf = HeapAlloc(GetProcessHeap(), 0, sizeof blank);
+        DWORD rd;
+        while (buf && GetTickCount64() < g_stDeadline && WinHttpReadData(r, buf, sizeof blank, &rd) && rd) {
+            InterlockedCompareExchange64(&g_stFirst, (LONG64)GetTickCount64(), 0);
+            InterlockedAdd64(&g_stBytes, rd);
+        }
+        if (buf) HeapFree(GetProcessHeap(), 0, buf);
+    } else if (r && up) {
+        DWORD total = 25000000, done = 0, w;
+        if (WinHttpSendRequest(r, L"Content-Type: application/octet-stream", (DWORD)-1, NULL, 0, total, 0))
+            while (done < total && GetTickCount64() < g_stDeadline &&
+                   WinHttpWriteData(r, blank, total - done < sizeof blank ? total - done : sizeof blank, &w) && w) {
+                InterlockedCompareExchange64(&g_stFirst, (LONG64)GetTickCount64(), 0);
+                InterlockedAdd64(&g_stBytes, w);
+                done += w;
+            }
+    }
+    if (r) WinHttpCloseHandle(r);
+    if (c) WinHttpCloseHandle(c);
+    if (s) WinHttpCloseHandle(s);
+    return 0;
+}
+
+static double st_phase(int up)
+{
+    HANDLE th[4];
+    int n = 0;
+    g_stBytes = 0;
+    g_stFirst = 0;
+    g_stDeadline = GetTickCount64() + 8000;
+    for (int i = 0; i < 4; i++)
+        if ((th[n] = CreateThread(NULL, 64 * 1024, st_worker, up ? (void *)1 : NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL))) n++;
+    if (n) WaitForMultipleObjects(n, th, TRUE, 15000);
+    for (int i = 0; i < n; i++) CloseHandle(th[i]);
+    ULONG64 end = GetTickCount64(), first = (ULONG64)g_stFirst;
+    if (!first || end <= first || g_stBytes < 100000) return 0;
+    return (double)g_stBytes * 8.0 / ((end - first) / 1000.0);
+}
+
+#define WM_UPDATE (WM_APP + 4)
+static char  g_newVer[16];
+static DWORD g_checkUpdates = 1;
+static volatile LONG g_updRunning;
+
+static int ver_cmp(const char *a, const char *b)
+{
+    for (int i = 0; i < 3; i++) {
+        int x = atoi(a), y = atoi(b);
+        if (x != y) return x < y ? -1 : 1;
+        while (*a && *a != '.') a++;
+        while (*b && *b != '.') b++;
+        if (*a) a++;
+        if (*b) b++;
+    }
+    return 0;
+}
+
+static DWORD WINAPI upd_main(void *unused)
+{
+    (void)unused;
+    DWORD len = 0;
+    BYTE *body = load_net() ? http_get(L"api.github.com", L"/repos/DMTWEAKS/traysense/releases/latest", &len) : NULL;
+    if (body) {
+        char tag[16] = { 0 };
+        const char *end = (const char *)body + len, *p = (const char *)body;
+        while (p + 12 < end && memcmp(p, "\"tag_name\":", 11)) p++;
+        if (p + 12 < end) {
+            p += 11;
+            while (p < end && (*p == ' ' || *p == '"' || *p == 'v' || *p == 'V')) p++;
+            int n = 0;
+            while (p < end && n < 15 && ((*p >= '0' && *p <= '9') || *p == '.')) tag[n++] = *p++;
+            if (n && ver_cmp(tag, VERSION) > 0) {
+                lstrcpynA(g_newVer, tag, sizeof g_newVer);
+                PostMessageW(g_wnd, WM_UPDATE, 0, 0);
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, body);
+    }
+    g_updRunning = 0;
+    return 0;
+}
+
+static void check_updates(void)
+{
+    if (!g_checkUpdates || g_updRunning) return;
+    g_updRunning = 1;
+    HANDLE t = CreateThread(NULL, 64 * 1024, upd_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (t) CloseHandle(t);
+    else g_updRunning = 0;
+}
+
+static DWORD WINAPI st_main(void *unused)
+{
+    (void)unused;
+    double down = 0, up = 0;
+    if (load_net()) {
+        down = st_phase(0);
+        if (down > 0) up = st_phase(1);
+    }
+    g_stDown = down;
+    g_stUp = up;
+    PostMessageW(g_wnd, WM_SPEEDDONE, down > 0, 0);
+    return 0;
+}
+
+static void fmt_speed(wchar_t *out, int n, double bits)
+{
+    if (bits >= 1e9) _snwprintf(out, n, L"%.2f Gbps", bits / 1e9);
+    else _snwprintf(out, n, L"%.0f Mbps", bits / 1e6);
+    out[n - 1] = 0;
+}
+
+static void speed_test(void)
+{
+    DWORD one = 1, v = 0, sz = sizeof v;
+    if (g_stRunning) return;
+    RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"SpeedTestOk", RRF_RT_REG_DWORD, NULL, &v, &sz);
+    if (!v) {
+        if (MessageBoxW(g_wnd, L"The speed test downloads and uploads throwaway data from Cloudflare's speed test "
+                               L"server (speed.cloudflare.com) for a few seconds.\n\nOn a fast connection that can be "
+                               L"a few hundred MB, and games or downloads will slow down while it runs.\n\nRun it now?",
+                        APP L" \x2013 Speed test", MB_YESNO | MB_ICONQUESTION) != IDYES) return;
+        RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"SpeedTestOk", REG_DWORD, &one, sizeof one);
+    }
+    g_stRunning = 1;
+    HANDLE t = CreateThread(NULL, 64 * 1024, st_main, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
+    if (t) CloseHandle(t);
+    else g_stRunning = 0;
+}
 
 static void tray_refresh(int force)
 {
-    for (int m = 0; m < M_N; m++) {
+    for (int m = 0; m < M_TRAYN; m++) {
         int on = g_mode == MODE_TRAY && ((g_mask >> m) & 1);
         if (!on) {
             if (g_shown[m]) { tray(m, NIM_DELETE); g_shown[m] = 0; }
@@ -870,17 +1279,23 @@ static void tray_refresh(int force)
 typedef struct {
     HWND wnd, tb;
     int child, primary, W, H, compact, wideW, fontDpi, icoOK[4];
-    RECT lastPos;
-    wchar_t sig[160];
+    RECT lastPos, grc[8];
+    int ngrp, gid[8], vert;
+    wchar_t sig[320];
     HFONT font, small, ico;
+    HBITMAP big;
+    DWORD *bp;
+    int bigW, bigH;
 } BAR;
 enum { SHOW_MAIN, SHOW_ALL, SHOW_OTHERS };
+enum { POS_TRAY, POS_APPS, POS_LEFT };
+enum { ROWS_AUTO, ROWS_ONE, ROWS_TWO };
 static BAR   g_bars[MAX_BARS];
 static BAR  *bar = g_bars;
 static int   g_dpi = 96;
-static DWORD g_where = SHOW_MAIN;
+static DWORD g_where = SHOW_MAIN, g_pos = POS_TRAY, g_rows = ROWS_AUTO;
 
-typedef struct { int glyph, sh, x, y, w, al, f, row; wchar_t t[8]; COLORREF c; } SEG;
+typedef struct { int glyph, sh, x, y, w, h, al, f; wchar_t t[16]; COLORREF c; } SEG;
 enum { G_CPU, G_RAM, G_GPU, G_DISK };
 
 static int SC(int v) { return MulDiv(v, g_dpi, 96); }
@@ -935,6 +1350,7 @@ static void bar_create(HWND tb, int primary)
     if (bar->font) DeleteObject(bar->font);
     if (bar->small) DeleteObject(bar->small);
     if (bar->ico) DeleteObject(bar->ico);
+    if (bar->big) DeleteObject(bar->big);
     ZeroMemory(bar, sizeof *bar);
     bar->tb = tb;
     bar->primary = primary;
@@ -964,6 +1380,7 @@ static void bar_destroy(BAR *b)
     if (b->font) DeleteObject(b->font);
     if (b->small) DeleteObject(b->small);
     if (b->ico) DeleteObject(b->ico);
+    if (b->big) DeleteObject(b->big);
     ZeroMemory(b, sizeof *b);
 }
 
@@ -981,7 +1398,7 @@ static int find_taskbars(HWND *out, int max)
     return n;
 }
 
-typedef struct { HWND tb; LONG ok, trayL, appsR; } SCAN;
+typedef struct { HWND tb; LONG ok, trayL, appsR, leftL, leftR; } SCAN;
 static SCAN g_scan[MAX_BARS];
 static CRITICAL_SECTION g_scanCs;
 static IUIAutomation *g_uia;
@@ -1021,7 +1438,7 @@ static int starts(const wchar_t *s, const wchar_t *p)
     return s && !wcsncmp(s, p, wcslen(p));
 }
 
-static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
+static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps, LONG *outLeftL, LONG *outLeftR)
 {
     static RECT rc[256];
     static BYTE app[256];
@@ -1064,8 +1481,22 @@ static int scan_one(HWND tb, int primary, LONG *outTray, LONG *outApps)
     RECT nr;
     if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left && nr.left < trayL) trayL = nr.left;
     if ((primary && !apps) || trayL <= appsR) return 0;
+    static BYTE used[256];
+    int cur = tr.left, mid = tr.left + tbw / 2, bestL = 0, bestR = 0;
+    ZeroMemory(used, sizeof used);
+    for (;;) {
+        int k = -1;
+        for (int i = 0; i < n; i++)
+            if (!used[i] && rc[i].left < appsR && (k < 0 || rc[i].left < rc[k].left)) k = i;
+        if (k < 0) break;
+        used[k] = 1;
+        if (cur < mid && rc[k].left - cur > bestR - bestL) { bestL = cur; bestR = rc[k].left; }
+        if (rc[k].right > cur) cur = rc[k].right;
+    }
     *outTray = trayL;
     *outApps = appsR;
+    *outLeftL = bestL;
+    *outLeftR = bestR;
     return 1;
 }
 
@@ -1077,8 +1508,8 @@ static void uia_scan(void)
     int n = find_taskbars(tbs, MAX_BARS), ok = uia_init();
     for (int i = 0; i < n; i++) {
         res[i].tb = tbs[i];
-        res[i].trayL = res[i].appsR = 0;
-        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR);
+        res[i].trayL = res[i].appsR = res[i].leftL = res[i].leftR = 0;
+        res[i].ok = ok && scan_one(tbs[i], tbs[i] == main, &res[i].trayL, &res[i].appsR, &res[i].leftL, &res[i].leftR);
     }
     EnterCriticalSection(&g_scanCs);
     ZeroMemory(g_scan, sizeof g_scan);
@@ -1086,12 +1517,17 @@ static void uia_scan(void)
     LeaveCriticalSection(&g_scanCs);
 }
 
-static int scan_for(HWND tb, int *trayL, int *appsR)
+static int scan_for(HWND tb, int *trayL, int *appsR, int *leftL, int *leftR)
 {
     int ok = 0;
     EnterCriticalSection(&g_scanCs);
     for (int i = 0; i < MAX_BARS; i++)
-        if (g_scan[i].tb == tb && g_scan[i].ok) { *trayL = g_scan[i].trayL; *appsR = g_scan[i].appsR; ok = 1; break; }
+        if (g_scan[i].tb == tb && g_scan[i].ok) {
+            *trayL = g_scan[i].trayL; *appsR = g_scan[i].appsR;
+            *leftL = g_scan[i].leftL; *leftR = g_scan[i].leftR;
+            ok = 1;
+            break;
+        }
     LeaveCriticalSection(&g_scanCs);
     return ok;
 }
@@ -1100,28 +1536,48 @@ static void bar_place(void)
 {
     RECT tr, nr;
     if (!bar->wnd) return;
-    if (!bar->tb || !GetWindowRect(bar->tb, &tr) || tr.bottom - tr.top > tr.right - tr.left) {
+    if (!bar->tb || !GetWindowRect(bar->tb, &tr)) {
         ShowWindow(bar->wnd, SW_HIDE);
         return;
     }
     get_dpi();
-    int trayL, appsR, scan = scan_for(bar->tb, &trayL, &appsR);
+    if (tr.bottom - tr.top > tr.right - tr.left) {
+        HWND tn = FindWindowExW(bar->tb, NULL, bar->primary ? L"TrayNotifyWnd" : L"ClockButton", NULL);
+        int bottom = tn && GetWindowRect(tn, &nr) && nr.bottom > nr.top ? nr.top : tr.bottom - SC(120);
+        int x = tr.left, y = bottom - SC(10) - bar->H + SC(g_offset);
+        if (y < tr.top) y = tr.top;
+        if (bar->child) { POINT p = { x, y }; ScreenToClient(bar->tb, &p); x = p.x; y = p.y; }
+        RECT want = { x, y, x + bar->W, y + bar->H };
+        int top = bar->child ? GetWindow(bar->tb, GW_CHILD) == bar->wnd : 1;
+        if (memcmp(&want, &bar->lastPos, sizeof want) || !top || !IsWindowVisible(bar->wnd)) {
+            SetWindowPos(bar->wnd, bar->child ? HWND_TOP : HWND_TOPMOST, x, y, bar->W, bar->H, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            bar->lastPos = want;
+        }
+        return;
+    }
+    int trayL, appsR, leftL = 0, leftR = 0, scan = scan_for(bar->tb, &trayL, &appsR, &leftL, &leftR);
     if (!scan) {
         HWND tn = FindWindowExW(bar->tb, NULL, bar->primary ? L"TrayNotifyWnd" : L"ClockButton", NULL);
         if (tn && GetWindowRect(tn, &nr) && nr.right > nr.left) trayL = nr.left;
         else trayL = tr.right - (bar->primary ? SC(280) : SC(12));
         appsR = tr.left;
     }
-    int h = tr.bottom - tr.top;
-    int right = trayL - SC(10) + SC(g_offset);
-    int avail = right - (scan ? appsR + SC(6) : tr.left);
-    int compact = bar->compact ? bar->wideW > avail - SC(10) : bar->wideW > avail;
+    int pos = g_pos;
+    if (!scan && pos != POS_TRAY) pos = POS_TRAY;
+    if (pos == POS_LEFT && leftR - leftL < SC(60)) pos = POS_TRAY;
+    int gapL = scan ? appsR + SC(10) : tr.left, gapR = trayL - SC(10);
+    int avail = pos == POS_LEFT ? leftR - leftL - SC(20) : gapR - gapL;
+    int compact = g_rows == ROWS_TWO ? 1 : g_rows == ROWS_ONE ? 0 :
+                  bar->compact ? bar->wideW > avail - SC(10) : bar->wideW > avail;
     if (compact != bar->compact) {
         bar->compact = compact;
         bar->sig[0] = 0;
         PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
     }
-    int x = right - bar->W, y = tr.top;
+    if (pos != POS_TRAY && bar->W > avail) pos = POS_TRAY;
+    int x = pos == POS_LEFT ? leftL + SC(10) : pos == POS_APPS ? gapL : gapR - bar->W;
+    x += SC(g_offset);
+    int h = tr.bottom - tr.top, y = tr.top;
     if (bar->child) { POINT p = { x, y }; ScreenToClient(bar->tb, &p); x = p.x; y = p.y; }
     RECT want = { x, y, x + bar->W, y + h };
     int top = bar->child ? GetWindow(bar->tb, GW_CHILD) == bar->wnd : 1;
@@ -1136,8 +1592,8 @@ static void seg_pct(SEG *s, int m, COLORREF fg)
 {
     s->glyph = 0; s->c = fg; s->al = 255;
     if (!g_ok[m]) lstrcpyW(s->t, L"--");
-    else _snwprintf(s->t, 8, L"%d%%", (int)(g_val[m] + 0.5));
-    s->t[7] = 0;
+    else _snwprintf(s->t, 16, L"%d%%", (int)(g_val[m] + 0.5));
+    s->t[15] = 0;
 }
 static void seg_temp(SEG *s, int m, COLORREF fg)
 {
@@ -1145,14 +1601,24 @@ static void seg_temp(SEG *s, int m, COLORREF fg)
     s->glyph = 0; s->c = fg; s->al = 255;
     if (!g_ok[m]) { lstrcpyW(s->t, L"--\x00B0"); return; }
     double t = g_val[m];
-    _snwprintf(s->t, 8, L"%d\x00B0", (int)(t + 0.5)); s->t[7] = 0;
+    _snwprintf(s->t, 16, L"%d\x00B0", (int)(t + 0.5)); s->t[15] = 0;
     if (t >= crit) s->c = g_light ? RGB(200, 25, 25) : RGB(255, 75, 65);
     else if (t >= hot) s->c = g_light ? RGB(195, 95, 0) : RGB(255, 170, 55);
 }
 static void seg_label(SEG *s, const wchar_t *t, COLORREF fg)
 {
     s->glyph = 0; s->c = fg; s->al = 150;
-    lstrcpynW(s->t, t, 8);
+    lstrcpynW(s->t, t, 16);
+}
+static void seg_mhz(SEG *s, int m, COLORREF fg)
+{
+    s->glyph = 0; s->c = fg; s->al = 255;
+    _snwprintf(s->t, 16, L"%d MHz", (int)(g_val[m] + 0.5)); s->t[15] = 0;
+}
+static void seg_watts(SEG *s, int m, COLORREF fg)
+{
+    s->glyph = 0; s->c = fg; s->al = 255;
+    _snwprintf(s->t, 16, L"%dW", (int)(g_val[m] + 0.5)); s->t[15] = 0;
 }
 
 static void draw_gpu(HDC dc, int x0, int y0, int sz)
@@ -1240,16 +1706,22 @@ static int text_w(HDC dc, const wchar_t *t)
 static int layout(HDC dc, SEG *sg, int n, int compact, int HB)
 {
     int gs = SC(16) * SS, top, h, d1, d2, X = SC(4) * SS;
+    TEXTMETRICW tm;
     if (!compact) {
         SelectObject(dc, bar->font);
         ink(dc, L'0', &top, &h, &d1, &d2);
+        GetTextMetricsW(dc, &tm);
         for (int i = 0; i < n; i++) {
-            if (sg[i].glyph) { if (i) X += SC(14) * SS; sg[i].w = gs; }
-            else {
+            if (sg[i].glyph) {
+                if (i) X += SC(14) * SS;
+                sg[i].w = sg[i].h = gs;
+                sg[i].y = HB / 2 - gs / 2;
+            } else {
                 X += (sg[i - 1].glyph ? SC(6) : sg[i].al < 255 ? SC(9) : sg[i - 1].al < 255 ? SC(4) : SC(5)) * SS;
                 sg[i].w = text_w(dc, sg[i].t);
+                sg[i].h = tm.tmHeight;
                 sg[i].y = HB / 2 - (top + h / 2);
-                sg[i].f = 0; sg[i].row = -1;
+                sg[i].f = 0;
             }
             sg[i].x = X; X += sg[i].w;
         }
@@ -1257,122 +1729,197 @@ static int layout(HDC dc, SEG *sg, int n, int compact, int HB)
     }
     SelectObject(dc, bar->small);
     ink(dc, L'0', &top, &h, &d1, &d2);
+    GetTextMetricsW(dc, &tm);
     int gap = SC(3) * SS, yTop = HB / 2 - gap / 2 - h - top, yBot = HB / 2 + gap / 2 - top, yMid = HB / 2 - h / 2 - top;
     for (int i = 0; i < n;) {
         if (sg[i].glyph) {
             if (i) X += SC(10) * SS;
-            sg[i].x = X; sg[i].w = gs; X += gs;
+            sg[i].x = X; sg[i].w = sg[i].h = gs; sg[i].y = HB / 2 - gs / 2; X += gs;
             i++;
             continue;
         }
         int a = i, b = (i + 1 < n && !sg[i + 1].glyph && sg[i + 1].al == 255) ? i + 1 : -1;
         X += (sg[a - 1].glyph ? SC(5) : SC(7)) * SS;
         int wa = text_w(dc, sg[a].t), wb = b >= 0 ? text_w(dc, sg[b].t) : 0;
-        sg[a].x = X; sg[a].w = wa; sg[a].f = 1;
+        sg[a].x = X; sg[a].w = wa; sg[a].f = 1; sg[a].h = tm.tmHeight;
         if (b >= 0) {
-            sg[a].y = yTop; sg[a].row = 0;
-            sg[b].x = X; sg[b].w = wb; sg[b].f = 1; sg[b].y = yBot; sg[b].row = 1;
-        } else { sg[a].y = yMid; sg[a].row = -1; }
+            sg[a].y = yTop;
+            sg[b].x = X; sg[b].w = wb; sg[b].f = 1; sg[b].y = yBot; sg[b].h = tm.tmHeight;
+        } else sg[a].y = yMid;
         X += wa > wb ? wa : wb;
         i = b >= 0 ? b + 1 : a + 1;
     }
     return X + SC(4) * SS;
 }
 
+static int layout_col(HDC dc, SEG *sg, int n, int WB)
+{
+    int gs = SC(16) * SS, top, h, d1, d2, Y = SC(6) * SS;
+    TEXTMETRICW tm;
+    SelectObject(dc, bar->small);
+    ink(dc, L'0', &top, &h, &d1, &d2);
+    GetTextMetricsW(dc, &tm);
+    for (int i = 0; i < n; i++) {
+        sg[i].f = 1;
+        if (sg[i].glyph) {
+            if (i) Y += SC(10) * SS;
+            sg[i].w = sg[i].h = gs;
+            sg[i].x = (WB - gs) / 2;
+            sg[i].y = Y;
+            Y += gs + SC(4) * SS;
+            continue;
+        }
+        sg[i].w = text_w(dc, sg[i].t);
+        sg[i].h = tm.tmHeight;
+        sg[i].x = (WB - sg[i].w) / 2;
+        sg[i].y = Y - top;
+        Y += h + SC(4) * SS;
+    }
+    return Y + SC(2) * SS;
+}
+
+static void find_groups(SEG *sg, int n)
+{
+    bar->ngrp = 0;
+    for (int i = 0; i < n && bar->ngrp < 8; i++) {
+        if (!sg[i].glyph) continue;
+        RECT r = { sg[i].x / SS, sg[i].y / SS, (sg[i].x + sg[i].w) / SS, (sg[i].y + sg[i].h) / SS };
+        for (int k = i + 1; k < n && !sg[k].glyph; k++) {
+            if (sg[k].x / SS < r.left) r.left = sg[k].x / SS;
+            if (sg[k].y / SS < r.top) r.top = sg[k].y / SS;
+            if ((sg[k].x + sg[k].w) / SS > r.right) r.right = (sg[k].x + sg[k].w) / SS;
+            if ((sg[k].y + sg[k].h) / SS > r.bottom) r.bottom = (sg[k].y + sg[k].h) / SS;
+        }
+        InflateRect(&r, SC(5), SC(4));
+        bar->grc[bar->ngrp] = r;
+        bar->gid[bar->ngrp++] = sg[i].sh;
+    }
+}
+
 static void bar_draw(int force)
 {
-    static COLORREF colOf[2][1024];
-    static BYTE alOf[2][1024];
     static BYTE gc[64 * 64], lut[256];
     if (!lut[255]) for (int i = 0; i < 256; i++) lut[i] = (BYTE)(255.0 * pow(i / 255.0, 0.8) + 0.5);
     if (!bar->wnd) return;
-    RECT tr; int H = 40;
-    if (bar->tb && GetWindowRect(bar->tb, &tr)) H = tr.bottom - tr.top;
-    if (H < 16) H = 16;
+    RECT tr = { 0, 0, 0, 40 };
+    if (bar->tb) GetWindowRect(bar->tb, &tr);
+    int vert = tr.bottom - tr.top > tr.right - tr.left;
+    int H = vert ? 0 : tr.bottom - tr.top, VW = tr.right - tr.left;
+    if (!vert && H < 16) H = 16;
     if (H > 400) H = 400;
+    if (VW > 400) VW = 400;
+    bar->vert = vert;
     get_dpi();
     COLORREF fg = g_light ? RGB(0, 0, 0) : RGB(255, 255, 255);
 
-    SEG sg[14]; int n = 0;
-    if ((g_mask & (1u << M_CPU)) || ((g_mask & (1u << M_CPUT)) && g_ok[M_CPUT])) {
+    SEG sg[24]; int n = 0;
+    ZeroMemory(sg, sizeof sg);
+    int cpuT = (g_mask & (1u << M_CPUT)) && g_ok[M_CPUT], cpuW = (g_mask & (1u << M_CPUW)) && g_ok[M_CPUW];
+    if ((g_mask & (1u << M_CPU)) || cpuT || cpuW) {
         sg[n].glyph = 1; sg[n].sh = G_CPU; n++;
         if (g_mask & (1u << M_CPU)) seg_pct(&sg[n++], M_CPU, fg);
-        if ((g_mask & (1u << M_CPUT)) && g_ok[M_CPUT]) seg_temp(&sg[n++], M_CPUT, fg);
+        if (cpuT) seg_temp(&sg[n++], M_CPUT, fg);
+        if (cpuW) seg_watts(&sg[n++], M_CPUW, fg);
     }
     if (g_mask & (1u << M_RAM)) {
         sg[n].glyph = 1; sg[n].sh = G_RAM; n++;
         seg_pct(&sg[n++], M_RAM, fg);
     }
-    int gpuT = (g_mask & (1u << M_GPUT)) && g_ok[M_GPUT];
-    if ((g_mask & ((1u << M_GPU) | (1u << M_VRAM))) || gpuT) {
+    int gpuT = (g_mask & (1u << M_GPUT)) && g_ok[M_GPUT], gpuW = (g_mask & (1u << M_GPUW)) && g_ok[M_GPUW];
+    int gpuC = (g_mask & (1u << M_GPUCLK)) && g_ok[M_GPUCLK], memC = (g_mask & (1u << M_MEMCLK)) && g_ok[M_MEMCLK];
+    if ((g_mask & ((1u << M_GPU) | (1u << M_VRAM))) || gpuT || gpuW || gpuC || memC) {
         sg[n].glyph = 1; sg[n].sh = G_GPU; n++;
         if (g_mask & (1u << M_GPU)) seg_pct(&sg[n++], M_GPU, fg);
         if (gpuT) seg_temp(&sg[n++], M_GPUT, fg);
+        if (gpuW && g_gpuPowerPct) {
+            seg_label(&sg[n++], L"TDP", fg);
+            seg_pct(&sg[n++], M_GPUW, fg);
+        } else if (gpuW) seg_watts(&sg[n++], M_GPUW, fg);
+        if (gpuC) seg_mhz(&sg[n++], M_GPUCLK, fg);
         if (g_mask & (1u << M_VRAM)) {
             seg_label(&sg[n++], L"VRAM", fg);
             seg_pct(&sg[n++], M_VRAM, fg);
         }
+        if (memC) {
+            seg_label(&sg[n++], L"Mem", fg);
+            seg_mhz(&sg[n++], M_MEMCLK, fg);
+        }
     }
-    if ((g_mask & (1u << M_DISKT)) && g_ok[M_DISKT]) {
+    int diskT = (g_mask & (1u << M_DISKT)) && g_ok[M_DISKT], diskA = (g_mask & (1u << M_DISKA)) && g_ok[M_DISKA];
+    if (diskT || diskA) {
         sg[n].glyph = 1; sg[n].sh = G_DISK; n++;
-        seg_temp(&sg[n++], M_DISKT, fg);
+        if (diskA) seg_pct(&sg[n++], M_DISKA, fg);
+        if (diskT) seg_temp(&sg[n++], M_DISKT, fg);
     }
 
-    wchar_t sig[160]; int p = _snwprintf(sig, 160, L"%d|%d|%d|%d|%d|", H, g_dpi, g_light, n, bar->compact);
-    for (int i = 0; i < n && p > 0 && p < 140; i++)
-        if (!sg[i].glyph) p += _snwprintf(sig + p, 160 - p, L"%s%06X|", sg[i].t, (unsigned)sg[i].c);
-    sig[159] = 0;
+    wchar_t sig[320]; int p = _snwprintf(sig, 320, L"%d|%d|%d|%d|%d|%d|", vert ? VW : H, vert, g_dpi, g_light, n, bar->compact);
+    for (int i = 0; i < n && p > 0 && p < 290; i++)
+        if (!sg[i].glyph) p += _snwprintf(sig + p, 320 - p, L"%s%06X|", sg[i].t, (unsigned)sg[i].c);
+    sig[319] = 0;
     if (!force && !lstrcmpW(sig, bar->sig)) { bar_place(); return; }
     lstrcpyW(bar->sig, sig);
 
     HDC mdc = CreateCompatibleDC(NULL);
     bar_fonts(mdc);
-    int HB = H * SS;
-
     HGDIOBJ of = SelectObject(mdc, bar->font);
-    bar->wideW = (layout(mdc, sg, n, 0, HB) + SS - 1) / SS;
-    int W = bar->compact ? (layout(mdc, sg, n, 1, HB) + SS - 1) / SS : bar->wideW;
-    if (W > 1024) W = 1024;
+    int W, HB;
+    if (vert) {
+        W = VW;
+        H = (layout_col(mdc, sg, n, W * SS) + SS - 1) / SS;
+        if (H > 1200) H = 1200;
+        HB = H * SS;
+        bar->wideW = W;
+    } else {
+        HB = H * SS;
+        bar->wideW = (layout(mdc, sg, n, 0, HB) + SS - 1) / SS;
+        W = bar->compact ? (layout(mdc, sg, n, 1, HB) + SS - 1) / SS : bar->wideW;
+        if (W > 1024) W = 1024;
+    }
     int WB = W * SS;
+    find_groups(sg, n);
+    BYTE *segmap = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (SIZE_T)W * H);
+    if (!segmap) { SelectObject(mdc, of); DeleteDC(mdc); return; }
 
     BITMAPINFO bi; ZeroMemory(&bi, sizeof bi);
     bi.bmiHeader.biSize = sizeof bi.bmiHeader;
     bi.bmiHeader.biWidth = WB; bi.bmiHeader.biHeight = -HB;
     bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
     DWORD *bp, *px;
-    HBITMAP big = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, (void **)&bp, NULL, 0);
+    if (!bar->big || bar->bigW != WB || bar->bigH != HB) {
+        if (bar->big) DeleteObject(bar->big);
+        bar->big = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, (void **)&bar->bp, NULL, 0);
+        bar->bigW = WB;
+        bar->bigH = HB;
+    }
+    HBITMAP big = bar->big;
+    bp = bar->bp;
     bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
     HBITMAP bmp = CreateDIBSection(mdc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
     if (!big || !bmp) {
-        if (big) DeleteObject(big);
         if (bmp) DeleteObject(bmp);
+        HeapFree(GetProcessHeap(), 0, segmap);
         SelectObject(mdc, of); DeleteDC(mdc); return;
     }
     HGDIOBJ ob = SelectObject(mdc, big);
     ZeroMemory(bp, (SIZE_T)WB * HB * 4);
     SetBkMode(mdc, TRANSPARENT);
     SetTextColor(mdc, RGB(255, 255, 255));
-    for (int r = 0; r < 2; r++)
-        for (int i = 0; i < W; i++) { colOf[r][i] = fg; alOf[r][i] = 255; }
-
     for (int i = 0; i < n; i++) {
         if (sg[i].glyph) continue;
         SelectObject(mdc, sg[i].f ? bar->small : bar->font);
         TextOutW(mdc, sg[i].x, sg[i].y, sg[i].t, lstrlenW(sg[i].t));
-        for (int r = 0; r < 2; r++) {
-            if (sg[i].row >= 0 && sg[i].row != r) continue;
-            for (int k = sg[i].x / SS - 1; k <= (sg[i].x + sg[i].w) / SS + 1 && k < W; k++)
-                if (k >= 0) { colOf[r][k] = sg[i].c; alOf[r][k] = (BYTE)sg[i].al; }
-        }
+        int x0 = sg[i].x / SS - 1, x1 = (sg[i].x + sg[i].w) / SS + 1, y0 = sg[i].y / SS, y1 = (sg[i].y + sg[i].h) / SS + 1;
+        for (int y = y0 < 0 ? 0 : y0; y < y1 && y < H; y++)
+            for (int x = x0 < 0 ? 0 : x0; x < x1 && x < W; x++) segmap[y * W + x] = (BYTE)(i + 1);
     }
     for (int i = 0; i < n; i++)
-        if (sg[i].glyph && sg[i].sh == G_GPU) draw_gpu(mdc, sg[i].x, HB / 2 - sg[i].w / 2, sg[i].w);
+        if (sg[i].glyph && sg[i].sh == G_GPU) draw_gpu(mdc, sg[i].x, sg[i].y, sg[i].w);
     SelectObject(mdc, bar->ico ? bar->ico : bar->font);
     for (int i = 0; i < n; i++) {
         if (!sg[i].glyph || sg[i].sh == G_GPU || !bar->icoOK[sg[i].sh]) continue;
         int top, h, left, w;
         ink(mdc, ICO_CH[sg[i].sh], &top, &h, &left, &w);
-        TextOutW(mdc, sg[i].x + (sg[i].w - w) / 2 - left, HB / 2 - (top + h / 2), &ICO_CH[sg[i].sh], 1);
+        TextOutW(mdc, sg[i].x + (sg[i].w - w) / 2 - left, sg[i].y + sg[i].h / 2 - (top + h / 2), &ICO_CH[sg[i].sh], 1);
     }
     GdiFlush();
 
@@ -1383,16 +1930,16 @@ static void bar_draw(int force)
                 const DWORD *row = bp + (y * SS + j) * WB + x * SS;
                 for (int i = 0; i < SS; i++) sum += row[i] & 0xFF;
             }
-            int r = y >= H / 2;
-            DWORD a = lut[sum / (SS * SS)] * alOf[r][x] / 255;
-            COLORREF c = colOf[r][x];
+            int k = segmap[y * W + x];
+            DWORD a = lut[sum / (SS * SS)] * (k ? sg[k - 1].al : 255) / 255;
+            COLORREF c = k ? sg[k - 1].c : fg;
             px[y * W + x] = a ? (a << 24) | ((GetRValue(c) * a / 255) << 16) | ((GetGValue(c) * a / 255) << 8) | (GetBValue(c) * a / 255)
                               : 0x01000000;
         }
     SelectObject(mdc, bmp);
-    DeleteObject(big);
+    HeapFree(GetProcessHeap(), 0, segmap);
 
-    int gs = SC(16), gy = (H - gs) / 2;
+    int gs = SC(16);
     for (int i = 0; i < n; i++) {
         if (!sg[i].glyph || sg[i].sh == G_GPU || bar->icoOK[sg[i].sh]) continue;
         glyph_cov(sg[i].sh == G_CPU ? SH_CPU : SH_RAM, gs > 64 ? 64 : gs, gc);
@@ -1400,7 +1947,7 @@ static void bar_draw(int force)
         for (int y = 0; y < gs && y < 64; y++)
             for (int xx = 0; xx < gs && xx < 64; xx++) {
                 DWORD a = gc[y * gs + xx];
-                int Xp = X0 + xx, Y = gy + y;
+                int Xp = X0 + xx, Y = sg[i].y / SS + y;
                 if (!a || Xp >= W || Y < 0 || Y >= H) continue;
                 px[Y * W + Xp] = (a << 24) | ((GetRValue(fg) * a / 255) << 16) | ((GetGValue(fg) * a / 255) << 8) | (GetBValue(fg) * a / 255);
             }
@@ -1418,6 +1965,260 @@ static void bar_draw(int force)
     DeleteObject(bmp);
     DeleteDC(mdc);
     bar_place();
+}
+
+#define HIST 150
+static float g_hist[M_N][HIST];
+static BYTE  g_histOk[M_N][HIST];
+static int   g_hpos, g_hcount;
+static HWND  g_graph;
+static BAR  *g_graphBar;
+static int   g_graphGid = -1, g_graphFontDpi;
+static HFONT g_graphFont, g_graphBold;
+
+static void hist_push(void)
+{
+    for (int m = 0; m < M_N; m++) {
+        g_hist[m][g_hpos] = (float)g_val[m];
+        g_histOk[m][g_hpos] = (BYTE)g_ok[m];
+    }
+    g_hpos = (g_hpos + 1) % HIST;
+    if (g_hcount < HIST) g_hcount++;
+}
+
+enum { K_PCT, K_TEMP, K_WATT, K_MHZ };
+typedef struct { int m, kind; const wchar_t *name; COLORREF col; } SERIES;
+
+static int group_series(int gid, SERIES *o)
+{
+    int n = 0;
+#define ADD(mm, k, nm, c) if (g_mask >> (mm) & 1) { o[n].m = (mm); o[n].kind = (k); o[n].name = (nm); o[n].col = (c); n++; }
+    COLORREF hot = RGB(255, 160, 60), pw = RGB(240, 200, 60), clk = RGB(80, 200, 190);
+    if (gid == G_CPU) {
+        ADD(M_CPU, K_PCT, L"CPU usage", RGB(80, 190, 255));
+        ADD(M_CPUT, K_TEMP, L"CPU temperature", hot);
+        ADD(M_CPUW, K_WATT, L"CPU power", pw);
+    } else if (gid == G_RAM) {
+        ADD(M_RAM, K_PCT, L"RAM usage", RGB(185, 145, 255));
+    } else if (gid == G_GPU) {
+        ADD(M_GPU, K_PCT, L"GPU usage", RGB(118, 215, 90));
+        ADD(M_GPUT, K_TEMP, L"GPU temperature", hot);
+        ADD(M_GPUW, g_gpuPowerPct ? K_PCT : K_WATT, g_gpuPowerPct ? L"GPU power (TDP)" : L"GPU power", pw);
+        ADD(M_GPUCLK, K_MHZ, L"GPU clock", clk);
+        ADD(M_VRAM, K_PCT, L"VRAM usage", RGB(118, 215, 90));
+        ADD(M_MEMCLK, K_MHZ, L"VRAM clock", clk);
+    } else if (gid == G_DISK) {
+        ADD(M_DISKA, K_PCT, L"Storage utilization", RGB(150, 170, 255));
+        ADD(M_DISKT, K_TEMP, L"SSD temperature", hot);
+    }
+#undef ADD
+    return n;
+}
+
+static void value_text(const SERIES *sr, double v, wchar_t *t)
+{
+    switch (sr->kind) {
+    case K_PCT:  _snwprintf(t, 24, L"%d%%", (int)(v + 0.5)); break;
+    case K_TEMP: _snwprintf(t, 24, L"%d\x00B0" L"C", (int)(v + 0.5)); break;
+    case K_WATT: _snwprintf(t, 24, L"%d W", (int)(v + 0.5)); break;
+    default:     _snwprintf(t, 24, L"%d MHz", (int)(v + 0.5)); break;
+    }
+    t[23] = 0;
+}
+
+static void blend(DWORD *px, int W, int H, int x0, int y0, const BYTE *cov, int cw, int ch, COLORREF c, int alpha)
+{
+    for (int y = 0; y < ch; y++)
+        for (int x = 0; x < cw; x++) {
+            int X = x0 + x, Y = y0 + y, a = cov[y * cw + x] * alpha / 255;
+            if (!a || X < 0 || Y < 0 || X >= W || Y >= H) continue;
+            DWORD d = px[Y * W + X];
+            int r = (GetRValue(c) * a + ((d >> 16) & 0xFF) * (255 - a)) / 255;
+            int g = (GetGValue(c) * a + ((d >> 8) & 0xFF) * (255 - a)) / 255;
+            int b = (GetBValue(c) * a + (d & 0xFF) * (255 - a)) / 255;
+            px[Y * W + X] = (DWORD)(r << 16 | g << 8 | b);
+        }
+}
+
+static void coverage(int w, int h, int mode, const POINT *pts, int np, int pen, BYTE *out)
+{
+    int S = SS;
+    BITMAPINFO bi; ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = w * S; bi.bmiHeader.biHeight = -h * S;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    DWORD *p;
+    HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&p, NULL, 0);
+    ZeroMemory(out, (SIZE_T)w * h);
+    if (!bm) { DeleteDC(dc); return; }
+    HGDIOBJ ob = SelectObject(dc, bm);
+    ZeroMemory(p, (SIZE_T)w * h * S * S * 4);
+    if (mode == 0) {
+        SelectObject(dc, GetStockObject(WHITE_BRUSH));
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        Polygon(dc, pts, np);
+    } else if (mode == 1) {
+        HPEN pn = CreatePen(PS_SOLID, pen, RGB(255, 255, 255));
+        HGDIOBJ op = SelectObject(dc, pn);
+        Polyline(dc, pts, np);
+        SelectObject(dc, op);
+        DeleteObject(pn);
+    } else {
+        SelectObject(dc, GetStockObject(WHITE_BRUSH));
+        SelectObject(dc, GetStockObject(NULL_PEN));
+        RoundRect(dc, 0, 0, w * S + 1, h * S + 1, pen, pen);
+    }
+    GdiFlush();
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            unsigned sum = 0;
+            for (int j = 0; j < S; j++)
+                for (int i = 0; i < S; i++) sum += p[(y * S + j) * w * S + x * S + i] & 0xFF;
+            out[y * w + x] = (BYTE)(sum / (S * S));
+        }
+    SelectObject(dc, ob);
+    DeleteObject(bm);
+    DeleteDC(dc);
+}
+
+static void graph_hide(void)
+{
+    if (g_graph) ShowWindow(g_graph, SW_HIDE);
+    g_graphBar = NULL;
+    g_graphGid = -1;
+}
+
+static void graph_draw(void)
+{
+    SERIES sr[8];
+    BAR *b = g_graphBar;
+    if (!g_graph || !b || !b->wnd || g_graphGid < 0) return;
+    int ns = group_series(g_graphGid, sr);
+    if (!ns) { graph_hide(); return; }
+    bar = b;
+    get_dpi();
+    if (!g_graphFont || g_graphFontDpi != g_dpi) {
+        if (g_graphFont) DeleteObject(g_graphFont);
+        if (g_graphBold) DeleteObject(g_graphBold);
+        g_graphFont = CreateFontW(-SC(12), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+        g_graphBold = CreateFontW(-SC(12), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET, 0, 0, ANTIALIASED_QUALITY, 0, L"Segoe UI");
+        g_graphFontDpi = g_dpi;
+    }
+    int pad = SC(10), gw = SC(240), gh = SC(30), lh = SC(17), row = lh + gh + SC(8);
+    int W = gw + 2 * pad, H = pad + ns * row - SC(8) + pad;
+    COLORREF bg = g_light ? RGB(249, 249, 249) : RGB(38, 38, 38), fg = g_light ? RGB(20, 20, 20) : RGB(240, 240, 240);
+    COLORREF dim = g_light ? RGB(110, 110, 110) : RGB(160, 160, 160), grid = g_light ? RGB(225, 225, 225) : RGB(62, 62, 62);
+
+    BITMAPINFO bi; ZeroMemory(&bi, sizeof bi);
+    bi.bmiHeader.biSize = sizeof bi.bmiHeader;
+    bi.bmiHeader.biWidth = W; bi.bmiHeader.biHeight = -H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    DWORD *px;
+    HDC dc = CreateCompatibleDC(NULL);
+    HBITMAP bm = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, (void **)&px, NULL, 0);
+    BYTE *cov = HeapAlloc(GetProcessHeap(), 0, (SIZE_T)W * H);
+    POINT *pts = HeapAlloc(GetProcessHeap(), 0, sizeof(POINT) * (HIST + 2));
+    if (!bm || !cov || !pts) goto done;
+    HGDIOBJ ob = SelectObject(dc, bm);
+    for (int i = 0; i < W * H; i++) px[i] = (DWORD)(GetRValue(bg) << 16 | GetGValue(bg) << 8 | GetBValue(bg));
+    SetBkMode(dc, TRANSPARENT);
+
+    for (int k = 0; k < ns; k++) {
+        int y0 = pad + k * row, gy = y0 + lh;
+        int last = (g_hpos + HIST - 1) % HIST;
+        double cur = g_hist[sr[k].m][last], mx = 0;
+        wchar_t val[24] = L"--";
+        if (g_hcount && g_histOk[sr[k].m][last]) value_text(&sr[k], cur, val);
+        SelectObject(dc, g_graphFont);
+        SetTextColor(dc, dim);
+        TextOutW(dc, pad, y0, sr[k].name, lstrlenW(sr[k].name));
+        SelectObject(dc, g_graphBold);
+        SetTextColor(dc, fg);
+        SIZE vs; GetTextExtentPoint32W(dc, val, lstrlenW(val), &vs);
+        TextOutW(dc, pad + gw - vs.cx, y0, val, lstrlenW(val));
+        for (int x = 0; x < gw; x++) {
+            px[(gy + gh - 1) * W + pad + x] = (DWORD)(GetRValue(grid) << 16 | GetGValue(grid) << 8 | GetBValue(grid));
+            if (x % 6 < 3) px[(gy + gh / 2) * W + pad + x] = px[(gy + gh - 1) * W + pad + x];
+        }
+        int cnt = g_hcount;
+        for (int i = 0; i < cnt; i++) {
+            int idx = (g_hpos + HIST - cnt + i) % HIST;
+            if (g_histOk[sr[k].m][idx] && g_hist[sr[k].m][idx] > mx) mx = g_hist[sr[k].m][idx];
+        }
+        double lo = 0, hi = sr[k].kind == K_PCT ? 100 : sr[k].kind == K_TEMP ? (mx > 100 ? mx : 100) : (mx > 0 ? mx * 1.15 : 1);
+        int np = 0;
+        for (int i = 0; i < cnt; i++) {
+            int idx = (g_hpos + HIST - cnt + i) % HIST;
+            if (!g_histOk[sr[k].m][idx]) continue;
+            double v = g_hist[sr[k].m][idx];
+            if (v < lo) v = lo;
+            if (v > hi) v = hi;
+            pts[np].x = (LONG)((double)(HIST - cnt + i) * (gw - 1) / (HIST - 1) * SS);
+            pts[np].y = (LONG)((gh - 2) * (1.0 - (v - lo) / (hi - lo)) * SS) + SS;
+            np++;
+        }
+        if (np >= 2) {
+            pts[np].x = pts[np - 1].x; pts[np].y = gh * SS;
+            pts[np + 1].x = pts[0].x;  pts[np + 1].y = gh * SS;
+            coverage(gw, gh, 0, pts, np + 2, 0, cov);
+            blend(px, W, H, pad, gy, cov, gw, gh, sr[k].col, 60);
+            coverage(gw, gh, 1, pts, np, SC(2) * SS * 3 / 4, cov);
+            blend(px, W, H, pad, gy, cov, gw, gh, sr[k].col, 255);
+        }
+    }
+    GdiFlush();
+    coverage(W, H, 2, NULL, 0, SC(16) * SS, cov);
+    for (int i = 0; i < W * H; i++) {
+        DWORD a = cov[i], c = px[i];
+        px[i] = a << 24 | (((c >> 16) & 0xFF) * a / 255) << 16 | (((c >> 8) & 0xFF) * a / 255) << 8 | ((c & 0xFF) * a / 255);
+    }
+
+    RECT gr = b->grc[0], tr, mr;
+    for (int i = 0; i < b->ngrp; i++) if (b->gid[i] == g_graphGid) gr = b->grc[i];
+    MapWindowPoints(b->wnd, NULL, (POINT *)&gr, 2);
+    GetWindowRect(b->tb, &tr);
+    MONITORINFO mi = { sizeof mi };
+    GetMonitorInfoW(MonitorFromWindow(b->tb, MONITOR_DEFAULTTONEAREST), &mi);
+    mr = mi.rcMonitor;
+    int x, y, gap = SC(8);
+    if (b->vert) {
+        y = (gr.top + gr.bottom) / 2 - H / 2;
+        x = tr.left > (mr.left + mr.right) / 2 ? tr.left - W - gap : tr.right + gap;
+    } else {
+        x = (gr.left + gr.right) / 2 - W / 2;
+        y = tr.top > (mr.top + mr.bottom) / 2 ? tr.top - H - gap : tr.bottom + gap;
+    }
+    if (x < mr.left + gap) x = mr.left + gap;
+    if (x + W > mr.right - gap) x = mr.right - gap - W;
+    if (y < mr.top + gap) y = mr.top + gap;
+    if (y + H > mr.bottom - gap) y = mr.bottom - gap - H;
+    POINT src = { 0, 0 }, dst = { x, y };
+    SIZE sz = { W, H };
+    BLENDFUNCTION bf = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA };
+    UpdateLayeredWindow(g_graph, NULL, &dst, &sz, dc, &src, 0, &bf, ULW_ALPHA);
+    SetWindowPos(g_graph, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SelectObject(dc, ob);
+done:
+    if (bm) DeleteObject(bm);
+    if (cov) HeapFree(GetProcessHeap(), 0, cov);
+    if (pts) HeapFree(GetProcessHeap(), 0, pts);
+    DeleteDC(dc);
+}
+
+static void graph_hover(HWND w, int x, int y)
+{
+    BAR *b = NULL;
+    int gid = -1;
+    for (int i = 0; i < MAX_BARS; i++) if (g_bars[i].wnd == w) b = &g_bars[i];
+    if (!b) return;
+    POINT pt = { x, y };
+    for (int i = 0; i < b->ngrp; i++) if (PtInRect(&b->grc[i], pt)) gid = b->gid[i];
+    if (gid < 0) { graph_hide(); return; }
+    if (b == g_graphBar && gid == g_graphGid) return;
+    g_graphBar = b;
+    g_graphGid = gid;
+    graph_draw();
 }
 
 static int wanted(HWND tb, HWND main, int others)
@@ -1460,18 +2261,39 @@ static DWORD WINAPI sampler(void *unused)
     (void)unused;
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     int com = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED));
-    unsigned tick = 0;
+    typedef BOOL (WINAPI *SWTE)(HANDLE, const LARGE_INTEGER *, LONG, PTIMERAPCROUTINE, LPVOID, void *, ULONG);
+    SWTE setTimerEx = (SWTE)(void *)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetWaitableTimerEx");
+    HANDLE timer = CreateWaitableTimerW(NULL, FALSE, NULL), waits[2] = { g_wake, timer };
+    DWORD armed = 0;
+    ULONG64 lastScan = 0;
     read_cpu();
     for (;;) {
         if (g_quit) break;
         if (InterlockedExchange(&g_rebuild, 0)) build_query();
         if (!g_paused) {
             sample();
-            if (com && g_mode == MODE_BAR && tick++ % (g_interval < 2000 ? 2 : 1) == 0) uia_scan();
+            ULONG64 now = GetTickCount64();
+            if (com && g_mode == MODE_BAR && (InterlockedExchange(&g_scanDirty, 0) || now - lastScan >= 15000)) {
+                uia_scan();
+                lastScan = now;
+            }
             PostMessageW(g_wnd, WM_SAMPLED, 0, 0);
         }
-        WaitForSingleObject(g_wake, g_paused ? INFINITE : g_interval);
+        if (g_paused || !timer) {
+            if (timer && armed) { CancelWaitableTimer(timer); armed = 0; }
+            WaitForSingleObject(g_wake, g_paused ? INFINITE : g_interval);
+            continue;
+        }
+        if (armed != g_interval) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)g_interval * 10000;
+            if (!setTimerEx || !setTimerEx(timer, &due, (LONG)g_interval, NULL, NULL, NULL, g_interval / 10))
+                SetWaitableTimer(timer, &due, (LONG)g_interval, NULL, NULL, FALSE);
+            armed = g_interval;
+        }
+        WaitForMultipleObjects(2, waits, FALSE, INFINITE);
     }
+    if (timer) CloseHandle(timer);
     if (g_q) PdhCloseQuery(g_q);
     if (g_uiaAll) IUIAutomationCondition_Release(g_uiaAll);
     if (g_uiaCache) IUIAutomationCacheRequest_Release(g_uiaCache);
@@ -1482,17 +2304,25 @@ static DWORD WINAPI sampler(void *unused)
 
 static void save(void)
 {
-    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Mask2", REG_DWORD, &g_mask, sizeof g_mask);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Mask3", REG_DWORD, &g_mask, sizeof g_mask);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Interval", REG_DWORD, &g_interval, sizeof g_interval);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Mode", REG_DWORD, &g_mode, sizeof g_mode);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Offset", REG_DWORD, &g_offset, sizeof g_offset);
     RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"ShowOn", REG_DWORD, &g_where, sizeof g_where);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Position", REG_DWORD, &g_pos, sizeof g_pos);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Rows", REG_DWORD, &g_rows, sizeof g_rows);
+    RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"CheckUpdates", REG_DWORD, &g_checkUpdates, sizeof g_checkUpdates);
 }
 static void load(void)
 {
     DWORD v, sz = sizeof v;
-    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Mask2", RRF_RT_REG_DWORD, NULL, &v, &sz) && (v & ((1u << M_N) - 1)))
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Mask3", RRF_RT_REG_DWORD, NULL, &v, &sz) && (v & ((1u << M_N) - 1)))
         g_mask = v & ((1u << M_N) - 1);
+    else {
+        sz = sizeof v;
+        if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Mask2", RRF_RT_REG_DWORD, NULL, &v, &sz) && (v & ((1u << M_TRAYN) - 1)))
+            g_mask = v & ((1u << M_TRAYN) - 1);
+    }
     sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Interval", RRF_RT_REG_DWORD, NULL, &v, &sz) && v >= 500 && v <= 60000)
         g_interval = v;
@@ -1505,7 +2335,28 @@ static void load(void)
     sz = sizeof v;
     if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"ShowOn", RRF_RT_REG_DWORD, NULL, &v, &sz) && v <= SHOW_OTHERS)
         g_where = v;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Position", RRF_RT_REG_DWORD, NULL, &v, &sz) && v <= POS_LEFT)
+        g_pos = v;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"Rows", RRF_RT_REG_DWORD, NULL, &v, &sz) && v <= ROWS_TWO)
+        g_rows = v;
+    sz = sizeof v;
+    if (!RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"CheckUpdates", RRF_RT_REG_DWORD, NULL, &v, &sz))
+        g_checkUpdates = v != 0;
 }
+static int is_admin(void);
+
+static void open_link(const wchar_t *url)
+{
+    wchar_t ex[MAX_PATH];
+    UINT n = GetWindowsDirectoryW(ex, MAX_PATH);
+    if (is_admin() && n && n < MAX_PATH - 16) {
+        lstrcatW(ex, L"\\explorer.exe");
+        ShellExecuteW(NULL, L"open", ex, url, NULL, SW_SHOWNORMAL);
+    } else ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
 static int is_admin(void)
 {
     BOOL a = FALSE; PSID g;
@@ -1696,13 +2547,36 @@ static void menu(void)
 {
     static const DWORD iv[3] = { 1000, 2000, 5000 };
     HMENU h = CreatePopupMenu(), sub = CreatePopupMenu();
+    if (g_newVer[0]) {
+        wchar_t u[64];
+        _snwprintf(u, 64, L"Update available: v%hs...", g_newVer);
+        u[63] = 0;
+        AppendMenuW(h, MF_STRING, 380, u);
+        AppendMenuW(h, MF_SEPARATOR, 0, NULL);
+    }
     for (int m = 0; m < M_N; m++) {
         wchar_t lbl[80];
         lstrcpyW(lbl, NAMES[m]);
+        if (m >= M_TRAYN && g_mode == MODE_TRAY) continue;
         if (m == M_CPUT && g_pioState == PIO_OK) lstrcatW(lbl, L"  (CPU sensor)");
+        else if (m == M_CPUW && g_pioState != PIO_OK) lstrcatW(lbl, L"  (needs CPU sensor)");
+        else if (m == M_GPUW && !pNvPower && !pNvEnergy && !pNvFields && !pAdlPMLog && !g_kmtPower) {
+            lstrcatW(lbl, L"  (not supported by this GPU)");
+            AppendMenuW(h, MF_STRING | MF_GRAYED, 100 + m, lbl);
+            continue;
+        }
         else if ((m == M_CPUT || m == M_GPUT || m == M_DISKT) && (g_mask >> m & 1) && !g_ok[m]) lstrcatW(lbl, L"  (no sensor found)");
         AppendMenuW(h, MF_STRING | ((g_mask >> m & 1) ? MF_CHECKED : 0), 100 + m, lbl);
     }
+    if (g_stRunning) AppendMenuW(h, MF_STRING | MF_GRAYED, 370, L"Speed test running...");
+    else if (g_stDown > 0) {
+        wchar_t st[96], a[32], b[32];
+        fmt_speed(a, 32, g_stDown);
+        fmt_speed(b, 32, g_stUp);
+        _snwprintf(st, 96, L"Run speed test  (last: \x2193%s  \x2191%s)", a, b);
+        st[95] = 0;
+        AppendMenuW(h, MF_STRING, 370, st);
+    } else AppendMenuW(h, MF_STRING, 370, L"Run speed test");
     if (g_pioState != PIO_OK && g_pioState != PIO_UNSUPPORTED) AppendMenuW(h, MF_STRING, 320, L"Turn on CPU temperature...");
     AppendMenuW(h, MF_SEPARATOR, 0, NULL);
     AppendMenuW(h, MF_STRING | (g_mode == MODE_BAR ? MF_CHECKED : 0), 310, L"Big labels on taskbar");
@@ -1712,8 +2586,20 @@ static void menu(void)
         AppendMenuW(on, MF_STRING | (g_where == SHOW_ALL ? MF_CHECKED : 0), 331, L"All taskbars");
         AppendMenuW(on, MF_STRING | (g_where == SHOW_OTHERS ? MF_CHECKED : 0), 332, L"Other monitors only");
         AppendMenuW(h, MF_POPUP, (UINT_PTR)on, L"Show on");
-        AppendMenuW(h, MF_STRING, 311, L"Move left");
-        AppendMenuW(h, MF_STRING, 312, L"Move right");
+        HMENU ps = CreatePopupMenu(), rw = CreatePopupMenu();
+        AppendMenuW(ps, MF_STRING | (g_pos == POS_TRAY ? MF_CHECKED : 0), 340, L"Next to tray");
+        AppendMenuW(ps, MF_STRING | (g_pos == POS_APPS ? MF_CHECKED : 0), 341, L"After apps");
+        AppendMenuW(ps, MF_STRING | (g_pos == POS_LEFT ? MF_CHECKED : 0), 342, L"Left side");
+        AppendMenuW(h, MF_POPUP, (UINT_PTR)ps, L"Position");
+        AppendMenuW(rw, MF_STRING | (g_rows == ROWS_AUTO ? MF_CHECKED : 0), 350, L"Auto");
+        AppendMenuW(rw, MF_STRING | (g_rows == ROWS_ONE ? MF_CHECKED : 0), 351, L"One row");
+        AppendMenuW(rw, MF_STRING | (g_rows == ROWS_TWO ? MF_CHECKED : 0), 352, L"Two rows");
+        AppendMenuW(h, MF_POPUP, (UINT_PTR)rw, L"Layout");
+
+        int anyVert = 0;
+        for (int i = 0; i < MAX_BARS; i++) if (g_bars[i].wnd && g_bars[i].vert) anyVert = 1;
+        AppendMenuW(h, MF_STRING, 311, anyVert ? L"Move up" : L"Move left");
+        AppendMenuW(h, MF_STRING, 312, anyVert ? L"Move down" : L"Move right");
         AppendMenuW(h, MF_STRING, 313, L"Reset position");
     }
     AppendMenuW(sub, MF_STRING | (g_interval == 1000 ? MF_CHECKED : 0), 200, L"1 second");
@@ -1721,7 +2607,9 @@ static void menu(void)
     AppendMenuW(sub, MF_STRING | (g_interval == 5000 ? MF_CHECKED : 0), 202, L"5 seconds (lowest power)");
     AppendMenuW(h, MF_POPUP, (UINT_PTR)sub, L"Refresh rate");
     AppendMenuW(h, MF_STRING | (autostart_on() ? MF_CHECKED : 0), 300, L"Start with Windows");
+    AppendMenuW(h, MF_STRING | (g_checkUpdates ? MF_CHECKED : 0), 381, L"Check for updates");
     AppendMenuW(h, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(h, MF_STRING, 390, L"Follow " X_HANDLE L" on X");
     AppendMenuW(h, MF_STRING, 399, L"Exit");
 
     POINT pt; GetCursorPos(&pt);
@@ -1734,6 +2622,7 @@ static void menu(void)
         DWORD nm = g_mask ^ (1u << (cmd - 100));
         if (!nm) return;
         g_mask = nm;
+        if (cmd - 100 == M_CPUW && (nm >> M_CPUW & 1) && g_pioState != PIO_OK) cpu_temp_setup(0);
         InterlockedExchange(&g_rebuild, 1);
         SetEvent(g_wake);
         refresh(1);
@@ -1755,6 +2644,12 @@ static void menu(void)
         save();
     }
     else if (cmd >= 330 && cmd <= 332) { g_where = cmd - 330; refresh(1); save(); }
+    else if (cmd >= 340 && cmd <= 342) { g_pos = cmd - 340; g_offset = 0; refresh(1); save(); }
+    else if (cmd >= 350 && cmd <= 352) { g_rows = cmd - 350; refresh(1); save(); }
+    else if (cmd == 370) speed_test();
+    else if (cmd == 380) open_link(RELEASES);
+    else if (cmd == 390) open_link(X_URL);
+    else if (cmd == 381) { g_checkUpdates = !g_checkUpdates; save(); if (g_checkUpdates) check_updates(); }
     else if (cmd == 320) cpu_temp_setup(0);
     else if (cmd == 399) DestroyWindow(g_wnd);
 }
@@ -1763,25 +2658,88 @@ static LRESULT CALLBACK barproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_RBUTTONUP:     menu(); return 0;
+    case WM_MOUSEMOVE: {
+        TRACKMOUSEEVENT t = { sizeof t, TME_LEAVE, w, 0 };
+        TrackMouseEvent(&t);
+        graph_hover(w, (short)LOWORD(lp), (short)HIWORD(lp));
+        return 0;
+    }
+    case WM_MOUSELEAVE:    graph_hide(); return 0;
+    case WM_RBUTTONUP:     graph_hide(); menu(); return 0;
     case WM_LBUTTONUP: {
         wchar_t tm[MAX_PATH];
         if (sys_path(tm, L"taskmgr.exe")) ShellExecuteW(NULL, L"open", tm, NULL, NULL, SW_SHOWNORMAL);
         return 0;
     }
     case WM_NCDESTROY:
-        for (int i = 0; i < MAX_BARS; i++) if (g_bars[i].wnd == w) g_bars[i].wnd = NULL;
+        for (int i = 0; i < MAX_BARS; i++) if (g_bars[i].wnd == w) {
+            if (g_graphBar == &g_bars[i]) graph_hide();
+            g_bars[i].wnd = NULL;
+        }
         break;
     }
     return DefWindowProcW(w, msg, wp, lp);
+}
+
+static void CALLBACK on_window_event(HWINEVENTHOOK hook, DWORD ev, HWND hwnd, LONG obj, LONG child, DWORD thread, DWORD time)
+{
+    (void)hook; (void)ev; (void)thread; (void)time;
+    if (obj != OBJID_WINDOW || child != CHILDID_SELF || !hwnd || GetAncestor(hwnd, GA_ROOT) != hwnd) return;
+    LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+    if ((ex & WS_EX_APPWINDOW) || (!(ex & WS_EX_TOOLWINDOW) && !GetWindow(hwnd, GW_OWNER)))
+        InterlockedExchange(&g_scanDirty, 1);
 }
 
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
     case WM_SAMPLED:
+        hist_push();
         refresh(0);
+        if (g_graphBar) graph_draw();
         return 0;
+    case WM_TIMER:
+        if (wp == 4) {
+            DWORD one = 1;
+            KillTimer(w, 4);
+            if (reg_dword(L"Welcomed")) return 0;
+            RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"Welcomed", REG_DWORD, &one, sizeof one);
+            if (MessageBoxW(g_wnd, L"Thanks for using TraySense!\n\nFollow " X_HANDLE L" on X for updates, new features "
+                                   L"and sneak peeks?", APP, MB_YESNO | MB_ICONINFORMATION) == IDYES)
+                open_link(X_URL);
+            return 0;
+        }
+        if (wp == 3) KillTimer(w, 3);
+        check_updates();
+        return 0;
+    case WM_UPDATE: {
+        wchar_t m[300], skip[16] = L"";
+        DWORD sz = sizeof skip;
+        RegGetValueW(HKEY_CURRENT_USER, REGKEY, L"SkipVersion", RRF_RT_REG_SZ, NULL, skip, &sz);
+        wchar_t nv[16];
+        _snwprintf(nv, 16, L"%hs", g_newVer); nv[15] = 0;
+        if (!lstrcmpW(skip, nv)) return 0;
+        _snwprintf(m, 300, L"TraySense v%s is available (you have v%hs).\n\nOpen the download page?\n\n"
+                           L"Follow " X_HANDLE L" on X to see what's new.", nv, VERSION);
+        m[299] = 0;
+        if (MessageBoxW(g_wnd, m, APP, MB_YESNO | MB_ICONINFORMATION) == IDYES)
+            open_link(RELEASES);
+        else
+            RegSetKeyValueW(HKEY_CURRENT_USER, REGKEY, L"SkipVersion", REG_SZ, nv, (lstrlenW(nv) + 1) * sizeof(wchar_t));
+        return 0;
+    }
+    case WM_SPEEDDONE: {
+        wchar_t m[160], a[32], b[32];
+        g_stRunning = 0;
+        if (wp) {
+            fmt_speed(a, 32, g_stDown);
+            fmt_speed(b, 32, g_stUp);
+            _snwprintf(m, 160, L"Download: %s\nUpload: %s", a, b);
+        } else lstrcpyW(m, L"Couldn't reach the speed test server. Check your connection and try again.");
+        m[159] = 0;
+        MessageBoxW(g_wnd, m, APP L" \x2013 Speed test", wp ? MB_ICONINFORMATION : MB_ICONWARNING);
+        return 0;
+    }
     case WM_TRAY:
         if (lp == WM_RBUTTONUP || lp == WM_LBUTTONUP || lp == WM_CONTEXTMENU) menu();
         return 0;
@@ -1805,6 +2763,10 @@ static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         PostQuitMessage(0);
         return 0;
     }
+    if (msg == g_msgQuit && msg) {
+        DestroyWindow(w);
+        return 0;
+    }
     if (msg == g_taskbarCreated && msg) {
         for (int m = 0; m < M_N; m++) g_shown[m] = 0;
         bars_destroy();
@@ -1825,11 +2787,21 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     }
     if (is_admin()) lock_self();
     int restart = wcsstr(GetCommandLineW(), L"/restart") != NULL;
+    g_msgQuit = RegisterWindowMessageW(L"TraySense.Quit");
     for (int tries = 0;; tries++) {
         HANDLE mx = CreateMutexW(NULL, TRUE, L"Local\\TraySense.single");
         if (GetLastError() != ERROR_ALREADY_EXISTS) break;
         CloseHandle(mx);
-        if (!restart || tries > 40) return 0;
+        if (tries == 0 && !restart) {
+            HWND old = FindWindowW(APP, APP);
+            if (old) PostMessageW(old, g_msgQuit, 0, 0);
+        }
+        if (tries > 40) {
+            if (!restart)
+                MessageBoxW(NULL, L"TraySense is already running.\n\nRight click it on the taskbar and choose Exit, "
+                                  L"then open this one again.", APP, MB_ICONINFORMATION);
+            return 0;
+        }
         Sleep(150);
     }
 
@@ -1862,19 +2834,28 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE prev, LPSTR cmd, int show)
     WNDCLASSW wc; ZeroMemory(&wc, sizeof wc);
     wc.lpfnWndProc = wndproc; wc.hInstance = hi; wc.lpszClassName = APP;
     RegisterClassW(&wc);
+    wc.lpfnWndProc = DefWindowProcW; wc.lpszClassName = L"TraySenseGraph";
+    RegisterClassW(&wc);
     wc.lpfnWndProc = barproc; wc.lpszClassName = L"TraySenseBar";
     wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
     RegisterClassW(&wc);
     g_wnd = CreateWindowExW(WS_EX_TOOLWINDOW, APP, APP, WS_POPUP, 0, 0, 0, 0, NULL, NULL, hi, NULL);
     g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
+    g_graph = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT,
+                              L"TraySenseGraph", L"", WS_POPUP, 0, 0, 1, 1, NULL, NULL, hi, NULL);
     {
         typedef BOOL (WINAPI *CWMF)(HWND, UINT, DWORD, void *);
         CWMF f = (CWMF)(void *)GetProcAddress(GetModuleHandleW(L"user32.dll"), "ChangeWindowMessageFilterEx");
-        if (f) { f(g_wnd, g_taskbarCreated, 1, NULL); f(g_wnd, WM_TRAY, 1, NULL); }
+        if (f) { f(g_wnd, g_taskbarCreated, 1, NULL); f(g_wnd, WM_TRAY, 1, NULL); f(g_wnd, g_msgQuit, 1, NULL); }
     }
     RegisterPowerSettingNotification(g_wnd, &G_DISPLAY, DEVICE_NOTIFY_WINDOW_HANDLE);
+    SetWinEventHook(EVENT_OBJECT_SHOW, EVENT_OBJECT_HIDE, NULL, on_window_event, 0, 0,
+                    WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
 
     g_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+    SetTimer(g_wnd, 3, 30000, NULL);
+    SetTimer(g_wnd, 4, 90000, NULL);
+    SetTimer(g_wnd, 2, 24u * 60 * 60 * 1000, NULL);
     HANDLE th = CreateThread(NULL, 64 * 1024, sampler, NULL, STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     refresh(1);
 

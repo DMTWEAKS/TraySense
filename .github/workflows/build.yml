@@ -17,6 +17,14 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           persist-credentials: false
+      - name: Check version matches tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          v=$(sed -n 's/^#define VERSION  "\(.*\)"$/\1/p' traysense.c)
+          if [ "v$v" != "$GITHUB_REF_NAME" ]; then
+            echo "traysense.c says v$v but the tag is $GITHUB_REF_NAME"
+            exit 1
+          fi
       - name: Install MinGW-w64
         run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
       - name: Build

@@ -1,6 +1,6 @@
 # TraySense
 
-[![Downloads](https://img.shields.io/github/downloads/DMTWEAKS/traysense/total?label=downloads)](https://github.com/DMTWEAKS/traysense/releases) [![Latest release](https://img.shields.io/github/v/release/DMTWEAKS/traysense)](https://github.com/DMTWEAKS/traysense/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/DMTWEAKS/traysense/total?label=downloads)](https://github.com/DMTWEAKS/traysense/releases) [![Latest release](https://img.shields.io/github/v/release/DMTWEAKS/traysense)](https://github.com/DMTWEAKS/traysense/releases/latest) [![Follow on X](https://img.shields.io/badge/follow-%40DMQ8__2-black?logo=x)](https://x.com/DMQ8_2)
 
 Small system monitor that sits on the Windows taskbar next to the tray. Shows CPU, RAM, GPU, VRAM and temps.
 
@@ -12,9 +12,28 @@ It's one C file using plain Win32, so the exe is around 100 KB and it uses a 1-3
 
 Works on Windows 10 and 11.
 
+Made by [@DMQ8_2](https://x.com/DMQ8_2), follow for updates and new features.
+
 PawnIO gets installed automatically when you turn on CPU temp (needed to read the CPU sensor). Since the driver needs admin, TraySense then copies itself to Program Files and starts from there as admin on login.
 
 Temps are white when normal, orange when elevated and red when extremely high. For CPU and GPU that's 80°C and 90°C, for the SSD 65°C and 75°C.
+
+## Extras
+
+All off by default, turn them on from the right click menu:
+
+- CPU and GPU power draw (GPU shows watts on NVIDIA and AMD, TDP % on others)
+- GPU core clock and VRAM clock
+- Storage utilization (how busy your Windows drive is)
+- VRAM usage
+
+Other stuff:
+
+- Hover over any group to see a graph of the last few minutes
+- Position: next to the tray, after your apps or on the left side, one or two rows
+- Works on every monitor (right click > Show on) and on vertical taskbars
+- One click internet speed test (right click > Run speed test)
+- Tells you when there's a new version, you download it yourself
 
 ## Usage
 

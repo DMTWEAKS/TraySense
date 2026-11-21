@@ -15,4 +15,12 @@ If someone sends you TraySense from anywhere else, don't run it.
 
 ## What runs as admin
 
-Only when you turn on CPU temp. TraySense then installs the PawnIO driver (official installer, SHA-256 pinned), copies itself to `Program Files\TraySense` and starts from there at login. It never updates itself or downloads anything else.
+Only when you turn on CPU temp or CPU power. TraySense then installs the PawnIO driver (official installer, SHA-256 pinned), copies itself to `Program Files\TraySense` and starts from there at login.
+
+## What it connects to
+
+- `api.github.com`, once a day, to see if there's a newer release. It only shows a message and opens the releases page, it never downloads or runs an update. You can turn this off (right click > Check for updates).
+- `speed.cloudflare.com`, only when you click Run speed test. The test data is thrown away.
+- `github.com`, only when you turn on CPU temp, to download the PawnIO installer.
+
+Nothing else, and no data about your PC is sent anywhere.
